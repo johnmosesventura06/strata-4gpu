@@ -196,7 +196,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
               mapped(64, (void**) &h_flagA_, (void**) &m_flagA_) &&
               mapped(64, (void**) &h_flagB_, (void**) &m_flagB_) &&
               mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_, portable) &&
-              mapped(128, (void**) &h_flag2_, (void**) &m_flag2_, portable) &&
+              mapped(512, (void**) &h_flag2_, (void**) &m_flag2_, portable) &&   // PLAY-4GPU: (grp, tier) 64B lines
               mapped((size_t) (2 * list2_stride_) * 4, (void**) &h_list2_, (void**) &m_list2_) &&
               mapped(T * (uint64_t) xk_stride_, (void**) &h_xk_, (void**) &m_xk_) &&
               mapped(T * (N / 32) * 36, (void**) &h_xq1_, (void**) &m_xq1_) &&
@@ -784,7 +784,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // FFN read: the shared expert, and the next layer's prediction
         if (gpu2_) {
             if (!fork(g2s_, g2fork_)) return false;
-            wait_flag_ge(m_flag2_ + (size_t) grp * 16, (uint32_t) (l * G + grp + 1), g2s_);
+            // PLAY-4GPU: wait every tier's flag for this group before taking the merged list in
+            for (int t = 0; t < ntiers_; ++t)
+                wait_flag_ge(m_flag2_ + (size_t) (grp * ntiers_ + t) * 16, (uint32_t) (l * G + grp + 1), g2s_);
             fetch_listed_rows(m_list2_ + grp * list2_stride_, m_ymiss_ + (size_t) tb * K * N,
                               hit_out_ + (size_t) tb * K * N, list2_ + grp * list2_stride_, (int) (n * K), N, g2s_);
             stamp(l, kLayerStamps + 1, g2s_);
@@ -1131,8 +1133,8 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     *(volatile uint32_t*) h_flagB_ = 0;
     *(volatile uint32_t*) h_pseq_ = 0;
     *(volatile uint32_t*) h_pleflag_ = 0;
-    h_flag2_[0] = h_flag2_[16] = 0;
-    sink_.gpu2_ring = 0;
+    std::memset(h_flag2_, 0, 8 * 16 * sizeof(uint32_t));   // every (grp, tier) line, PLAY-4GPU
+    for (int t = 0; t < GpuPlanSink::kMaxTiers; ++t) sink_.tier_ring[t] = 0;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     last_t_ = T;
     last_pos0_ = pos0;
@@ -1150,8 +1152,10 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     auto release = [&] {
         h_list2_[0] = h_list2_[list2_stride_] = 0;
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        for (uint32_t* f : {h_flag_, h_flagA_, h_flagB_, h_pleflag_, h_flag2_, h_flag2_ + 16})
+        for (uint32_t* f : {h_flag_, h_flagA_, h_flagB_, h_pleflag_})
             *(volatile uint32_t*) f = 0xffffffffu;
+        for (int i = 0; i < 8; ++i)   // every (grp, tier) line, PLAY-4GPU
+            *(volatile uint32_t*) (h_flag2_ + (size_t) i * 16) = 0xffffffffu;
         cudaStreamSynchronize(cs_);
         return false;
     };
@@ -1229,20 +1233,30 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             *(volatile uint32_t*) h_flagA_ = want;
             raise_flag(h_flagB_, want);
         }
-        if (gpu2_ && sink_.gpu2_ring != want) {   // no second-GPU share went out (the pool failed): an empty one
-            sink_.gpu2_list[0] = 0;
-            std::atomic_thread_fence(std::memory_order_seq_cst);
-            *(volatile uint32_t*) sink_.gpu2_flag = want;
+        if (gpu2_) {   // no share went out to a tier (the pool failed): an empty one, and the merged list is dropped
+            bool any_fallback = false;
+            for (int t = 0; t < ntiers_; ++t)
+                if (sink_.tier_ring[t] != want) {
+                    any_fallback = true;
+                    std::atomic_thread_fence(std::memory_order_seq_cst);
+                    *(volatile uint32_t*) sink_.tier_flag[t] = want;
+                }
+            if (any_fallback && sink_.tier_list[0] != nullptr) sink_.tier_list[0][0] = 0;
         }
         *flag = want;
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
         ms_pool += ms_since(b);
-        if (gpu2_ && *(volatile uint32_t*) sink_.gpu2_flag < want) {
-            settle(true);   // a split window's other token group
-            late_flag = sink_.gpu2_flag;
-            late_want = want;
-            late_at = Clock::now();
-            ++late2;
+        if (gpu2_) {   // PLAY-4GPU: a tier's rows landed after the CPU's — count it once, watch its last line
+            bool any_late = false;
+            for (int t = 0; t < ntiers_; ++t)
+                if (*(volatile uint32_t*) sink_.tier_flag[t] < want) any_late = true;
+            if (any_late) {
+                settle(true);   // a split window's other token group
+                late_flag = sink_.tier_flag[ntiers_ - 1];
+                late_want = want;
+                late_at = Clock::now();
+                ++late2;
+            }
         }
         if (tail_ != nullptr && k + 1 == g.n_layers * G) tail_(tail_user_);
         // the next layer's prediction, published during this layer's pool, else microseconds later (its branch is
@@ -1407,8 +1421,11 @@ void Verifier::set_plan_slot(int grp) {
     sink_.staging = (unsigned long long) (staging_ + (size_t) (grp * per) * strata::kernels::cpu::expert_layout().max_blob);
     sink_.staging_cap = per;
     if (gpu2_) {
-        sink_.gpu2_list = h_list2_ + (size_t) grp * (size_t) list2_stride_;
-        sink_.gpu2_flag = h_flag2_ + (size_t) grp * 16;
+        sink_.tier_list[0] = h_list2_ + (size_t) grp * (size_t) list2_stride_;   // ONE merged list per group
+        sink_.tier_list[1] = sink_.tier_list[2] = sink_.tier_list[3] = nullptr;
+        for (int t = 0; t < ntiers_; ++t)
+            sink_.tier_flag[t] = h_flag2_ + (size_t) (grp * ntiers_ + t) * 16;
+        for (int t = ntiers_; t < GpuPlanSink::kMaxTiers; ++t) sink_.tier_flag[t] = nullptr;
         sink_.ring = cur_layer_ + 1;
     }
 }

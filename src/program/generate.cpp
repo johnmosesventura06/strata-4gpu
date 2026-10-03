@@ -616,10 +616,12 @@ bool pump_gap(Drive* t, std::string& err, bool all = false) {
     return true;
 }
 
-/// Whether the second GPU's work so far succeeded (Verifier::set_watch).
+/// Whether the tier GPUs' work so far succeeded (Verifier::set_watch).  PLAY-4GPU: every wired tier answers.
 bool drive_watch(void* user, std::string& err) {
     Drive* t = (Drive*) user;
-    return t->d.gpu2 == nullptr || t->d.gpu2->healthy(err);
+    for (int i = 0; i < t->d.n_tier; ++i)
+        if (t->d.tier[i] != nullptr && !t->d.tier[i]->healthy(err)) return false;
+    return true;
 }
 
 /// A window's last CPU rows are in (Verifier::set_tail).
@@ -2359,6 +2361,7 @@ int main(int argc, char** argv) {
         }
         if (ok) {
             drive.d.gpu2 = &gpu2;
+            drive.d.n_tier = 1;   // PLAY-4GPU Inc1: the arrays exist, one tier wired through the aliases
             drive.d.host_res2 = host_res2.data();
             drive.d.gpu2_min_bytes = (uint64_t) (o.second_gpu_min_mb * 1048576.0);
             std::fprintf(stderr, "strata generate: second GPU %d (%s): %zu experts from the profile and %zu empty slots, "

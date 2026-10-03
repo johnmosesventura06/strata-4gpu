@@ -159,10 +159,12 @@ public:
     /// host.  Set before the first `run`.
     void set_rows_in(RowsFn fn, void* user) { rows_in_ = fn; rows_user_ = user; }
     cudaEvent_t window_done() const { return done_; }
-    /// The pool gives a second GPU a share of each layer (`GpuPlanSink::gpu2_flag`): it writes its rows into the
-    /// pool's rows and raises its token group's flag, and a branch of the window, forked at the ring, takes them
-    /// into VRAM while the CPU works.  Set before the first `run`.
-    void set_gpu2(bool on) { gpu2_ = on; }
+    /// The pool gives tier GPUs a share of each layer (`GpuPlanSink::tier_flag`): each writes its rows into the
+    /// pool's rows and raises its token group's flag (one flag line per (group, tier)), and a branch of the window,
+    /// forked at the ring, waits for ALL the tiers' flags, then takes the merged entry list into VRAM while the CPU
+    /// works.  Set before the first `run`.  PLAY-4GPU: `n` tiers (0 off); set_gpu2 stays for the single-tier call.
+    void set_gpu2(bool on) { gpu2_ = on; ntiers_ = on ? 1 : 0; }
+    void set_tiers(int n) { gpu2_ = n > 0; ntiers_ = n; }
     /// `fn` is asked every ~2 ms while the host waits for a ring: on failure the window's waits are released and `run`
     /// returns the reason.  Set before the first `run`.
     void set_watch(WatchFn fn, void* user) { watch_ = fn; watch_user_ = user; }
@@ -252,9 +254,10 @@ private:
     int64_t xk_stride_ = 0;
     uint8_t* h_xk_ = nullptr;    uint8_t* m_xk_ = nullptr;      // T rows
     uint8_t* h_xq1_ = nullptr;   uint8_t* m_xq1_ = nullptr;     // T rows of n_embd / 32 blocks
-    // the second GPU's share (set_gpu2), per token group: the flag it raises (64 bytes apart) and its entries,
-    // [n, pad x3, entries] (mapped; `list2_` their device copies, which the combine reads)
+    // the tiers' share (set_tiers), per token group x tier: the flag each raises (64-byte lines, (grp * ntiers_ + t)
+    // * 16) and the MERGED entries, [n, pad x3, entries] (mapped; `list2_` their device copies, which the combine reads)
     bool gpu2_ = false;
+    int ntiers_ = 0;
     uint32_t* h_flag2_ = nullptr; uint32_t* m_flag2_ = nullptr;
     int32_t* h_list2_ = nullptr; int32_t* m_list2_ = nullptr;
     int32_t* list2_ = nullptr;
