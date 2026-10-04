@@ -18,6 +18,9 @@
 #include "strata/core/adaptive_tier.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/second_gpu.hpp"
+
+#include <fcntl.h>
+#include <unistd.h>
 #include "strata/core/split_head.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/layer.hpp"
@@ -3508,7 +3511,7 @@ int main(int argc, char** argv) {
         const double pool_ms0 = drive.cpu_ms;
         const int64_t misses0 = drive.d.multi_misses, entries0 = drive.d.multi_entries;
         const uint32_t sleeps0 = pool.sleeps();
-        if (o.stats) drive.d.routed.assign((size_t) (g.n_layers * g.n_expert), 0);
+        if (o.stats || !o.dump_routing.empty()) drive.d.routed.assign((size_t) (g.n_layers * g.n_expert), 0);
         if (use_mtp)
             mtp.on_draft = [&](int j, int32_t tok, float prob) {   // the drafts the next window will verify
                 if (lk == 0 && prob >= (float) o.spec_min_p) ver.ple_ahead(j + 1, tok);
@@ -3744,8 +3747,38 @@ int main(int argc, char** argv) {
     if (routing != nullptr) {
         std::fclose(routing);
         drive.routing = nullptr;
-        std::printf("%-24s %s (%lld records of layer, k, ids, weights)\n", "routing dumped",
-                    o.dump_routing.c_str(), (long long) drive.calls);
+    }
+    if (!o.dump_routing.empty() && !drive.d.routed.empty()) {   // PLAY-4GPU: the window counters, not the per-pool
+        // fwrite trace (whose stdio fd dies early beside the CUDA init: the file stayed 0 bytes through fclose).
+        const int rfd = ::open(o.dump_routing.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (rfd >= 0) {
+            long pairs = 0, entries = 0;
+            char buf[16384];   // read_trace counts one hit per id: the record carries n copies of the id
+            for (int64_t l = 0; l < g.n_layers; ++l)
+                for (int64_t e = 0; e < g.n_expert; ++e) {
+                    const uint32_t n = drive.d.routed[(size_t) (l * g.n_expert + e)];
+                    if (n == 0) continue;
+                    ++pairs;
+                    entries += n;
+                    const int32_t head[2] = {(int32_t) l, (int32_t) n};
+                    (void) ::write(rfd, head, 8);
+                    for (uint32_t q = 0; q < n; ) {
+                        const uint32_t c = (uint32_t) std::min<uint64_t>(n - q, 2048);
+                        for (uint32_t j = 0; j < c; ++j) ((int32_t*) buf)[j] = (int32_t) e;
+                        (void) ::write(rfd, buf, c * 4);
+                        q += c;
+                    }
+                    for (uint32_t q = 0; q < n; ) {
+                        const uint32_t c = (uint32_t) std::min<uint64_t>(n - q, 2048);
+                        for (uint32_t j = 0; j < c; ++j) ((float*) buf)[j] = 1.0f;
+                        (void) ::write(rfd, buf, c * 4);
+                        q += c;
+                    }
+                }
+            ::close(rfd);
+            std::printf("%-24s %s (%ld (layer, expert) pairs from the window counters)\n", "routing dumped",
+                        o.dump_routing.c_str(), pairs);
+        }
     }
     if (o.stage_timing) strata::core::stage_timing_report(g.n_layers);
 
