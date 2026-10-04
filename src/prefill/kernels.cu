@@ -110,7 +110,8 @@ constexpr int GRW_PER = N / 256;
 __global__ void __launch_bounds__(256)
 gr_write_norm_rs_kernel(float* __restrict__ R, const float* __restrict__ bo, const float* __restrict__ inj,
                         int64_t inj_ld, const float* __restrict__ w, float eps, float* __restrict__ rs_out,
-                        uint16_t* __restrict__ xn16, const uint16_t* __restrict__ partial) {
+                        uint16_t* __restrict__ xn16, const uint16_t* __restrict__ partial,
+                        const uint16_t* __restrict__ partial2, const uint16_t* __restrict__ partial3, int np) {
     __shared__ float sh[32];
     const int64_t row = blockIdx.x;                 // t * 4 + c
     const int64_t t = row / HC;
@@ -122,7 +123,10 @@ gr_write_norm_rs_kernel(float* __restrict__ R, const float* __restrict__ bo, con
 #pragma unroll
     for (int k = 0; k < GRW_PER; ++k) {
         const int d = threadIdx.x + 256 * k;
-        const float b = partial ? bo[t * N + d] + __half2float(__ushort_as_half(partial[t * N + d])) : bo[t * N + d];
+        float b = bo[t * N + d];
+        if (partial) b += __half2float(__ushort_as_half(partial[t * N + d]));
+        if (np > 1 && partial2) b += __half2float(__ushort_as_half(partial2[t * N + d]));
+        if (np > 2 && partial3) b += __half2float(__ushort_as_half(partial3[t * N + d]));
         const float x = fmaf(b, sc, r[d]);
         r[d] = x;
         v[k] = x;
@@ -159,11 +163,15 @@ __global__ void gr_mix_kernel(const float* __restrict__ xn, const float* __restr
     if (mixed_h) mixed_h[i] = hf(s);
 }
 __global__ void gr_write_kernel(float* __restrict__ R, const float* __restrict__ bo, const float* __restrict__ inj,
-                                int64_t inj_ld, int64_t T, const uint16_t* __restrict__ partial) {
+                                int64_t inj_ld, int64_t T, const uint16_t* __restrict__ partial,
+                                const uint16_t* __restrict__ partial2, const uint16_t* __restrict__ partial3, int np) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= T * D) return;
     const int64_t t = i / D, c = (i % D) / N, d = i % N;
-    const float b = partial ? bo[t * N + d] + __half2float(__ushort_as_half(partial[t * N + d])) : bo[t * N + d];
+    float b = bo[t * N + d];
+    if (partial) b += __half2float(__ushort_as_half(partial[t * N + d]));
+    if (np > 1 && partial2) b += __half2float(__ushort_as_half(partial2[t * N + d]));
+    if (np > 2 && partial3) b += __half2float(__ushort_as_half(partial3[t * N + d]));
     R[i] = fmaf(b, 2.0f * sigm(inj[t * inj_ld + c] / (float) HC), R[i]);
 }
 __global__ void gr_broadcast_kernel(const float* __restrict__ e, float* __restrict__ R, int64_t T) {
@@ -550,9 +558,12 @@ void gr_mix_r(const float* R, const float* rs, const float* w_norm, const float*
     check("gr_mix_r");
 }
 void gr_write_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_ld, const float* w_norm, float eps,
-                      float* rs, uint16_t* xn16, int64_t T, void* stream, const uint16_t* partial) {
+                      float* rs, uint16_t* xn16, int64_t T, void* stream, const uint16_t* const* partials, int np) {
+    const uint16_t* q0 = partials && np > 0 ? partials[0] : nullptr;
+    const uint16_t* q1 = partials && np > 1 ? partials[1] : nullptr;
+    const uint16_t* q2 = partials && np > 2 ? partials[2] : nullptr;
     gr_write_norm_rs_kernel<<<(unsigned) (T * HC), 256, 0, (cudaStream_t) stream>>>(R, bo, inj, inj_ld, w_norm, eps,
-                                                                                     rs, xn16, partial);
+                                                                                     rs, xn16, q0, q1, q2, np);
     check("gr_write_norm_rs");
 }
 void gr_silu(const float* lo, uint16_t* lo16, int64_t T, void* stream) {
@@ -565,8 +576,11 @@ void gr_mix(const float* xn, const float* gated, float* mixed, uint16_t* mixed16
     check("gr_mix");
 }
 void gr_write(float* R, const float* bo, const float* inj, int64_t inj_ld, int64_t T, void* stream,
-              const uint16_t* partial) {
-    gr_write_kernel<<<blocks_for(T * D), 256, 0, (cudaStream_t) stream>>>(R, bo, inj, inj_ld, T, partial);
+              const uint16_t* const* partials, int np) {
+    const uint16_t* q0 = partials && np > 0 ? partials[0] : nullptr;
+    const uint16_t* q1 = partials && np > 1 ? partials[1] : nullptr;
+    const uint16_t* q2 = partials && np > 2 ? partials[2] : nullptr;
+    gr_write_kernel<<<blocks_for(T * D), 256, 0, (cudaStream_t) stream>>>(R, bo, inj, inj_ld, T, q0, q1, q2, np);
     check("gr_write");
 }
 void gr_broadcast(const float* e, float* R, int64_t T, void* stream) {

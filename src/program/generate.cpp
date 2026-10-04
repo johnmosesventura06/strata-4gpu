@@ -747,41 +747,51 @@ struct SlotLoan {
 /// chunk needs, else allocated once for the longest chunk.
 struct PromptBuffers {
     strata::prefill::Prefill* prefill = nullptr;
-    strata::prefill::ExpertRunner* offload = nullptr;   // the second GPU's share, or null
+    std::vector<strata::prefill::ExpertRunner*> off;   // PLAY-4GPU: one runner per tier GPU, may be empty
+    const int32_t* skip_any = nullptr;                 // experts held anywhere: the runners' prefetch-area skip
     const strata::core::ModelGeometry* g = nullptr;
     const strata::core::SessionState* ss = nullptr;
-    SlotLoan loan, loan2;   // each GPU's cache (a null cache lends nothing)
-    bool lend = false, lend2 = false;
+    SlotLoan loan; std::vector<SlotLoan> loan2;   // each GPU's cache (a null cache lends nothing)
+    bool lend = false; std::vector<bool> lend2;
 
-    /// After the prompt path and its second GPU's runner have been initialized.
+    /// After the prompt path and its tier runners have been initialized.  PLAY-4GPU: every runner lends from, and
+    /// allocates in, its OWN card's cache; only the sums staging is on this card, so bytes_needed counts them.
     bool init(int64_t max_chunk, bool borrow, std::string& err) {
         lend = borrow && loan.cache != nullptr && loan.res != nullptr && !loan.res->empty() &&
-               loan.plan(strata::prefill::Prefill::bytes_needed(*g, *ss, max_chunk, offload != nullptr));
-        lend2 = offload != nullptr && borrow && loan2.cache != nullptr && loan2.res != nullptr && !loan2.res->empty() &&
-                loan2.plan(strata::prefill::ExpertRunner::bytes_needed(max_chunk, g->n_expert, true, true));
-        return (lend || prefill->bind(nullptr, 0, max_chunk, err)) &&
-               (offload == nullptr || lend2 || offload->bind(nullptr, 0, max_chunk, err));
+               loan.plan(strata::prefill::Prefill::bytes_needed(*g, *ss, max_chunk, (int) off.size()));
+        lend2.assign(off.size(), false);
+        for (size_t j = 0; j < off.size(); ++j)
+            lend2[j] = borrow && loan2[j].cache != nullptr && loan2[j].res != nullptr && !loan2[j].res->empty() &&
+                       loan2[j].plan(strata::prefill::ExpertRunner::bytes_needed(max_chunk, g->n_expert, true, true));
+        if (!(lend || prefill->bind(nullptr, 0, max_chunk, err))) return false;
+        for (size_t j = 0; j < off.size(); ++j)
+            if (!lend2[j] && !off[j]->bind(nullptr, 0, max_chunk, err)) return false;
+        return true;
     }
     /// Before a prompt whose chunks hold up to `chunk` tokens.
     bool take(int64_t chunk, std::string& err) {
-        // sized before either loan, from the residency both GPUs' prefetch areas are sized for
+        // sized before either loan, from the residency the prefetch areas are sized for
         const uint64_t need = lend ? prefill->bytes_for(chunk) : 0;
-        const uint64_t need2 = lend2 ? offload->bytes_for(chunk, loan.res ? loan.res->data() : nullptr) : 0;
         if (lend) {
             loan.plan(need);
             loan.lend();
             if (!prefill->bind(loan.base(), loan.bytes(), chunk, err)) return false;
         }
-        if (lend2) {
-            loan2.plan(need2);
-            loan2.lend();
-            if (!offload->bind(loan2.base(), loan2.bytes(), chunk, err)) return false;
+        for (size_t j = 0; j < off.size(); ++j) {   // PLAY-4GPU: each runner's area is sized against held-anywhere
+            if (!lend2[j]) continue;
+            const uint64_t need2 = off[j]->bytes_for(chunk, skip_any);
+            loan2[j].plan(need2);
+            loan2[j].lend();
+            if (!off[j]->bind(loan2[j].base(), loan2[j].bytes(), chunk, err)) return false;
         }
         return true;
     }
     /// After it: the lent slots refilled.
     bool give_back(strata::core::ExpertSource& src, std::string& err) {
-        return loan.give_back(src, g->n_expert, err) && loan2.give_back(src, g->n_expert, err);
+        if (!loan.give_back(src, g->n_expert, err)) return false;
+        for (auto& l2 : loan2)
+            if (!l2.give_back(src, g->n_expert, err)) return false;
+        return true;
     }
 };
 
@@ -1546,7 +1556,7 @@ int main(int argc, char** argv) {
         const bool borrow = !o.no_prefill_borrow && !o.expert_profile.empty();
         const int64_t prefill_mib = (o.prefill_chunk > 0 && !borrow)
             ? (int64_t) (strata::prefill::Prefill::bytes_needed(g, ss, o.prefill_chunk,
-                                                                o.second_gpu >= 0 && !o.no_prompt_offload) >> 20)
+                                                                o.no_prompt_offload ? 0 : (int) std::min<size_t>(o.tier_gpus.size(), 3)) >> 20)
             : 0;
         const int64_t reserve = ((int64_t) o.vram_reserve_mib + prefill_mib) << 20;
         int64_t slots = ((int64_t) free_b - reserve) / (int64_t) strata::kernels::cpu::expert_layout().max_blob;
@@ -2334,7 +2344,8 @@ int main(int argc, char** argv) {
                 size_t free_b = 0, total_b = 0;
                 cudaMemGetInfo(&free_b, &total_b);
                 // the prompt path's buffers borrow cache slots on the FIRST live tier, else they are reserved there
-                const bool offload_own = live_devs.empty() && o.prefill_chunk > 0 && !o.no_prompt_offload && o.no_prefill_borrow;
+                const bool offload_own = !o.no_prompt_offload && ti < std::min<size_t>(o.tier_gpus.size(), 3) &&
+                                         o.prefill_chunk > 0 && o.no_prefill_borrow;   // PLAY-4GPU: each runner's card
                 const uint64_t reserve = ((uint64_t) o.second_gpu_reserve_mib << 20) +
                     (offload_own ? strata::prefill::ExpertRunner::bytes_needed(o.prefill_chunk, g.n_expert, true, true) : 0);
                 const uint64_t budget = o.second_gpu_gib > 0 ? (uint64_t) (o.second_gpu_gib * 1073741824.0)
@@ -2457,31 +2468,50 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: token graph captured (48 layers, one launch per token)\n");
     }
 
-    // ---- the batched prompt path, and the second GPU's share of its experts (not --no-prompt-offload)
-    auto setup_prompt_path = [&](strata::prefill::Prefill& prefill, strata::prefill::ExpertRunner& offload,
-                                 PromptBuffers& pbuf, std::string& e) -> bool {
-        const bool off = !gpus2.empty() && !o.no_prompt_offload;   // PLAY-4GPU: the prompt path runs on tier 0
+    // ---- the batched prompt path, and the tier GPUs' share of its experts (not --no-prompt-offload)
+    // PLAY-4GPU: one runner per live tier (up to 3); an expert goes to the runner whose cache holds it, an expert
+    // no GPU holds is spread across them, and each runner computes its share on its own card.
+    auto setup_prompt_path = [&](strata::prefill::Prefill& prefill,
+                                 std::vector<std::unique_ptr<strata::prefill::ExpertRunner>>& offs,
+                                 std::vector<int32_t>& held_any, PromptBuffers& pbuf, std::string& e) -> bool {
+        const int n_off = !gpus2.empty() && !o.no_prompt_offload ? (int) std::min<size_t>(gpus2.size(), 3) : 0;
+        const bool off = n_off > 0;
         // a cache too small to lend the buffers would make them allocate on top of a card the cache filled to its
         // reserve, which then pages: the chunk halves until they fit in the lendable slots (it only reads slower)
         if (!o.no_prefill_borrow && d_res != nullptr && o.expert_cache > 0) {
             SlotLoan probe;
             probe.cache = &xcache;
             int64_t chunk = o.prefill_chunk;
-            while (chunk > 256 && !probe.plan(strata::prefill::Prefill::bytes_needed(g, ss, chunk, off))) chunk /= 2;
-            if (chunk != o.prefill_chunk && probe.plan(strata::prefill::Prefill::bytes_needed(g, ss, chunk, off))) {
+            while (chunk > 256 && !probe.plan(strata::prefill::Prefill::bytes_needed(g, ss, chunk, n_off))) chunk /= 2;
+            if (chunk != o.prefill_chunk && probe.plan(strata::prefill::Prefill::bytes_needed(g, ss, chunk, n_off))) {
                 std::fprintf(stderr, "strata generate: prompt chunk %lld -> %lld tokens so its buffers fit in the expert "
                                      "cache\n", (long long) o.prefill_chunk, (long long) chunk);
                 o.prefill_chunk = chunk;
             }
         }
-        if (off && !offload.init(live_devs[0], o.main_gpu, nullptr, srcp, &gpus2[0]->cache(),
-                                 res2s[0]->empty() ? nullptr : res2s[0]->data(), g.n_expert, o.prefill_chunk, true, e))
-            return false;
+        std::vector<strata::prefill::ExpertRunner*> off_ptrs;
+        std::vector<const int32_t*> offs_res;
+        for (int j = 0; j < n_off; ++j) {
+            offs.emplace_back(std::make_unique<strata::prefill::ExpertRunner>());
+            if (!offs.back()->init(live_devs[(size_t) j], o.main_gpu, nullptr, srcp, &gpus2[(size_t) j]->cache(),
+                                   res2s[(size_t) j]->empty() ? nullptr : res2s[(size_t) j]->data(), g.n_expert,
+                                   o.prefill_chunk, true, e))
+                return false;
+            off_ptrs.push_back(offs.back().get());
+            offs_res.push_back(res2s[(size_t) j]->empty() ? nullptr : res2s[(size_t) j]->data());
+        }
+        held_any.assign((size_t) (g.n_layers * g.n_expert), -1);   // held by ANY GPU: the runners' skip table
+        for (size_t i = 0; i < held_any.size(); ++i) {
+            bool h = !host_res.empty() && host_res[i] >= 0;
+            for (size_t j = 0; j < offs_res.size() && !h; ++j) h = offs_res[j] != nullptr && offs_res[j][i] >= 0;
+            if (h) held_any[i] = 0;
+        }
         if (!prefill.init(wt, g, ss, srcp, o.expert_cache > 0 ? &xcache : nullptr,
-                          host_res.empty() ? nullptr : host_res.data(), o.prefill_chunk, main_cs, off ? &offload : nullptr, e))
+                          host_res.empty() ? nullptr : host_res.data(), o.prefill_chunk, main_cs, off_ptrs, offs_res, e))
             return false;
         pbuf.prefill = &prefill;
-        pbuf.offload = off ? &offload : nullptr;
+        pbuf.off = off_ptrs;
+        pbuf.skip_any = held_any.empty() ? nullptr : held_any.data();
         pbuf.g = &g;
         pbuf.ss = &ss;
         if (d_res != nullptr) {
@@ -2490,11 +2520,13 @@ int main(int argc, char** argv) {
             pbuf.loan.d_res = d_res;
             pbuf.loan.device = pbuf.loan.main_device = o.main_gpu;
         }
-        if (off) {
-            pbuf.loan2.cache = &gpus2[0]->cache();
-            pbuf.loan2.res = res2s[0].get();
-            pbuf.loan2.device = live_devs[0];
-            pbuf.loan2.main_device = o.main_gpu;
+        for (int j = 0; j < n_off; ++j) {
+            pbuf.loan2.emplace_back();
+            auto& l2 = pbuf.loan2.back();
+            l2.cache = &gpus2[(size_t) j]->cache();
+            l2.res = res2s[(size_t) j].get();
+            l2.device = live_devs[(size_t) j];
+            l2.main_device = o.main_gpu;
         }
         return pbuf.init(o.prefill_chunk, !o.no_prefill_borrow, e);
     };
@@ -2535,17 +2567,21 @@ int main(int argc, char** argv) {
             return 2;
         }
         strata::prefill::Prefill prefill;
-        strata::prefill::ExpertRunner offload;
+        std::vector<std::unique_ptr<strata::prefill::ExpertRunner>> offs;
+        std::vector<int32_t> held_any;
         PromptBuffers pbuf;
-        if (!setup_prompt_path(prefill, offload, pbuf, err)) {
+        if (!setup_prompt_path(prefill, offs, held_any, pbuf, err)) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
             return 1;
         }
-        if (pbuf.lend || pbuf.lend2)
-            std::fprintf(stderr, "strata serve: the prompt path borrows up to %lld cache slots (%.2f GiB), %lld (%.2f GiB) "
-                                 "on the second GPU\n", (long long) pbuf.loan.slots(), (double) pbuf.loan.bytes() / 1073741824.0,
-                         (long long) pbuf.loan2.slots(), (double) pbuf.loan2.bytes() / 1073741824.0);
-        else
+        if (pbuf.lend || !pbuf.lend2.empty()) {
+            std::fprintf(stderr, "strata serve: the prompt path borrows up to %lld cache slots (%.2f GiB)",
+                         (long long) pbuf.loan.slots(), (double) pbuf.loan.bytes() / 1073741824.0);
+            for (size_t j = 0; j < pbuf.loan2.size(); ++j)   // PLAY-4GPU: each runner's loan, per tier
+                std::fprintf(stderr, ", %lld (%.2f GiB) on tier GPU %d", (long long) pbuf.loan2[j].slots(),
+                             (double) pbuf.loan2[j].bytes() / 1073741824.0, live_devs[j]);
+            std::fprintf(stderr, "\n");
+        } else
             std::fprintf(stderr, "strata serve: the prompt path allocates its own buffers (too few cache slots to borrow)\n");
         mem_mark("the head and the prompt path");
         strata::core::Verifier ver;
@@ -3096,22 +3132,27 @@ int main(int argc, char** argv) {
     int64_t pos_start = 0;
     int64_t spec_pos = 0;   // plan v0.3 P6: where the speculative loop starts (0 = not used)
     strata::prefill::Prefill prefill;
-    strata::prefill::ExpertRunner offload;
+    std::vector<std::unique_ptr<strata::prefill::ExpertRunner>> offs;
+    std::vector<int32_t> held_any;
     PromptBuffers pbuf;
     double prefill_batched_ms = 0;
     std::FILE* final_r = o.dump_final_r.empty() ? nullptr : std::fopen(o.dump_final_r.c_str(), "wb");
     std::vector<float> final_r_host(final_r ? (size_t) (g.hc * g.n_embd) : 0);
     if (o.prefill_chunk > 0 && n_prompt > 1) {
         const int64_t n_batched = (o.prefill_until > 0 && o.prefill_until < n_prompt - 1) ? o.prefill_until : n_prompt - 1;
-        if (!setup_prompt_path(prefill, offload, pbuf, err) || !pbuf.take(std::min(o.prefill_chunk, n_batched), err)) {
+        if (!setup_prompt_path(prefill, offs, held_any, pbuf, err) ||
+            !pbuf.take(std::min(o.prefill_chunk, n_batched), err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
-        if (pbuf.lend || pbuf.lend2)
-            std::fprintf(stderr, "strata generate: prompt path borrows %lld cache slots (%.2f GiB), %lld (%.2f GiB) on the "
-                                 "second GPU\n", (long long) pbuf.loan.slots(), (double) pbuf.loan.bytes() / 1073741824.0,
-                         (long long) pbuf.loan2.slots(), (double) pbuf.loan2.bytes() / 1073741824.0);
-        else
+        if (pbuf.lend || !pbuf.lend2.empty()) {
+            std::fprintf(stderr, "strata generate: prompt path borrows %lld cache slots (%.2f GiB)",
+                         (long long) pbuf.loan.slots(), (double) pbuf.loan.bytes() / 1073741824.0);
+            for (size_t j = 0; j < pbuf.loan2.size(); ++j)
+                std::fprintf(stderr, ", %lld (%.2f GiB) on tier GPU %d", (long long) pbuf.loan2[j].slots(),
+                             (double) pbuf.loan2[j].bytes() / 1073741824.0, live_devs[j]);
+            std::fprintf(stderr, "\n");
+        } else
             std::fprintf(stderr, "strata generate: prompt path allocates its own buffers (no cache slots to borrow)\n");
         if (!o.mtp.empty()) {
             if (!mtp.bind(wt, &native_head, nullptr, err)) {
@@ -3127,7 +3168,9 @@ int main(int argc, char** argv) {
             return 1;
         }
         // refill the lent slots from the arena and give them back to the decode tiers
-        const size_t n_lent[2] = {pbuf.loan.lent.size(), pbuf.loan2.lent.size()};
+        size_t n_lent2 = 0;
+        for (const auto& l2 : pbuf.loan2) n_lent2 += l2.lent.size();   // PLAY-4GPU: every tier's loan
+        const size_t n_lent[2] = {pbuf.loan.lent.size(), n_lent2};
         const Clock::time_point tr = Clock::now();
         if (!pbuf.give_back(*srcp, err)) {
             std::fprintf(stderr, "strata generate: refilling a lent slot failed: %s\n", err.c_str());
@@ -3149,11 +3192,11 @@ int main(int argc, char** argv) {
                      (long long) ps.tokens, (long long) ps.chunks, ps.ms_total,
                      ps.ms_total > 0 ? 1000.0 * (double) ps.tokens / ps.ms_total : 0.0, (long long) ps.experts_streamed,
                      (long long) ps.experts_prefetched, ps.ms_experts_host, (long long) ps.experts_resident, ps.ms_ple);
-        if (pbuf.offload != nullptr)
-            std::fprintf(stderr, "strata generate: prefill on the second GPU: experts streamed %lld (%lld ahead), "
-                                 "resident %lld; %.1f ms queuing, %.1f ms GPU\n", (long long) offload.experts_streamed,
-                         (long long) offload.experts_prefetched, (long long) offload.experts_resident, offload.ms_host,
-                         offload.ms_gpu);
+        for (size_t j = 0; j < offs.size(); ++j)   // PLAY-4GPU: each runner's prompt-path tally
+            std::fprintf(stderr, "strata generate: prefill on tier GPU %d: experts streamed %lld (%lld ahead), "
+                                 "resident %lld; %.1f ms queuing, %.1f ms GPU\n", live_devs[j],
+                         (long long) offs[j]->experts_streamed, (long long) offs[j]->experts_prefetched,
+                         (long long) offs[j]->experts_resident, offs[j]->ms_host, offs[j]->ms_gpu);
         if (o.prefill_profile) {
             std::fprintf(stderr, "strata generate: prefill GPU ms by section:");
             for (int i = 0; i < strata::prefill::kPsCount; ++i)

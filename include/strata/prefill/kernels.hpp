@@ -19,7 +19,8 @@ void gr_mix_r(const float* R, const float* rs, const float* w_norm, const float*
               int64_t T, void* stream, uint16_t* mixed_h = nullptr);
 /// gr_write, then gr_norm_rs of the written rows with the next read's norm weights, R read once.
 void gr_write_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_ld, const float* w_norm, float eps,
-                      float* rs, uint16_t* xn16, int64_t T, void* stream, const uint16_t* partial = nullptr);
+                      float* rs, uint16_t* xn16, int64_t T, void* stream,
+                      const uint16_t* const* partials = nullptr, int nparts = 0);   // PLAY-4GPU: up to 3 remote sums
 /// lo16[t, k] = bf16(silu(lo[t, k] / hc))
 void gr_silu(const float* lo, uint16_t* lo16, int64_t T, void* stream);
 /// mixed[t, d] = mean_c xn[t, c, d] * sigmoid(gated[t, c, d]); FP32, BF16 and FP16 (any of them may be null).
@@ -27,7 +28,7 @@ void gr_mix(const float* xn, const float* gated, float* mixed, uint16_t* mixed16
             uint16_t* mixed_h = nullptr);
 /// R[t, c, d] += (bo[t, d] (+ partial[t, d], FP16)) * 2 sigmoid(inj[t, c] / hc)   (inj has row stride inj_ld)
 void gr_write(float* R, const float* bo, const float* inj, int64_t inj_ld, int64_t T, void* stream,
-              const uint16_t* partial = nullptr);
+              const uint16_t* const* partials = nullptr, int nparts = 0);   // PLAY-4GPU: up to 3 remote sums
 /// R[t, c, :] = e[t, :] for all four streams (the embedding broadcast).
 void gr_broadcast(const float* e, float* R, int64_t T, void* stream);
 
