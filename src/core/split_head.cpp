@@ -36,8 +36,9 @@ SplitHead::~SplitHead() {
 }
 
 bool SplitHead::init(int device, int main_device, const std::vector<std::string>& shards, int64_t n_in,
-                     int64_t n_vocab, int64_t split, int max_t, std::string& err) {
-    if (split <= 0 || split >= n_vocab || max_t < 1 || max_t > strata::kernels::kVerifyMaxT) {
+                     int64_t n_vocab, int64_t split, int max_t, std::string& err, int64_t end) {
+    if (end <= 0) end = n_vocab;   // PLAY-4GPU: default = to the top of the vocabulary (the original behavior)
+    if (split <= 0 || split >= end || end > n_vocab || max_t < 1 || max_t > strata::kernels::kVerifyMaxT) {
         err = "split head: bad arguments";
         return false;
     }
@@ -46,7 +47,8 @@ bool SplitHead::init(int device, int main_device, const std::vector<std::string>
     max_t_ = max_t;
     n_in_ = n_in;
     split_ = split;
-    rows_ = n_vocab - split;
+    end_ = end;
+    rows_ = end - split;
     DeviceScope scope(dev_, main_);
     try {
         const strata::GgufModel model(shards);

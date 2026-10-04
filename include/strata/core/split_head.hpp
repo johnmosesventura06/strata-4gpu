@@ -25,12 +25,15 @@ public:
     SplitHead(const SplitHead&) = delete;
     SplitHead& operator=(const SplitHead&) = delete;
 
-    /// Rows [split, n_vocab) of `output.weight` in the model's shards on `device`, for windows of up to `max_t` tokens.
-    /// `main_device` is current again after every call.
+    /// Rows [split, end) of `output.weight` in the model's shards on `device`, for windows of up to `max_t` tokens
+    /// (PLAY-4GPU: `end` <= 0 means n_vocab, the original "everything above split").  `main_device` is current again
+    /// after every call.
     bool init(int device, int main_device, const std::vector<std::string>& shards, int64_t n_in, int64_t n_vocab,
-              int64_t split, int max_t, std::string& err);
+              int64_t split, int max_t, std::string& err, int64_t end = -1);
     bool on() const { return dev_ >= 0; }
     int64_t split() const { return split_; }
+    int64_t end() const { return end_; }
+    int64_t part_rows() const { return rows_; }
     uint64_t bytes() const { return bytes_; }
     /// Mapped: the head's input rows the main GPU writes (max_t x n_in floats) and the count it raises after them.
     float* input() const { return h_in_; }
@@ -49,7 +52,7 @@ private:
     bool capture(int T, bool logits, std::string& err);
 
     int dev_ = -1, main_ = 0, max_t_ = 0, type_ = -1;
-    int64_t n_in_ = 0, split_ = 0, rows_ = 0;
+    int64_t n_in_ = 0, split_ = 0, end_ = 0, rows_ = 0;
     uint64_t bytes_ = 0;
     cudaStream_t s_ = nullptr;
     void* w_ = nullptr;                                         // the rows' GGUF blocks

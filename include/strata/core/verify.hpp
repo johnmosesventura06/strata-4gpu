@@ -119,8 +119,13 @@ public:
     /// The head's logits of the last window's first `T` tokens, T * n_vocab floats, copied to host memory `out`.
     bool copy_logits(int T, float* out, std::string& err) const;
     /// The head's rows [split, n_vocab) on another GPU (`head` then holds rows [0, split)): the window hands the head's
-    /// input over, and `run` keeps each token's larger pick.  Set before `init`.
-    void set_split_head(SplitHead* sh) { shead_ = sh; }
+    /// input over, and `run` keeps each token's larger pick.  Set before `init`.  PLAY-4GPU: up to three parts, their
+    /// ranges contiguous from the main head's rows to n_vocab (set_split_heads).
+    void set_split_head(SplitHead* sh) { sheads_[0] = sh; n_shead_ = sh != nullptr ? 1 : 0; }
+    void set_split_heads(SplitHead* const* arr, int n) {
+        n_shead_ = n > 3 ? 3 : n;
+        for (int i = 0; i < 3; ++i) sheads_[i] = i < n_shead_ ? arr[i] : nullptr;
+    }
     /// Whole logits rows after every window (copy_logits, --window-logits): with a split head the second GPU's part
     /// then copies its rows back.  Set before `init`.
     void set_logits_wanted(bool on) { logits_wanted_ = on; }
@@ -213,7 +218,9 @@ private:
     float* h_ple_ = nullptr;     float* m_ple_ = nullptr;       // T * n_embd
     int32_t* h_out_ = nullptr;   int32_t* m_out_ = nullptr;     // T argmax ids
     float* h_val_ = nullptr;     float* m_val_ = nullptr;       // their logits (a split head's merge)
-    SplitHead* shead_ = nullptr;
+    SplitHead* sheads_[3] = {};                        // PLAY-4GPU: contiguous head parts on the tier GPUs
+    int n_shead_ = 0;
+    SplitHead*& shead_ = sheads_[0];                   // the single-part name the original code paths use
     bool logits_wanted_ = false;
     int64_t head_rows_ = 0;                                     // the head's rows here: n_vocab, or the split
     float* head_full_ = nullptr;                                // T whole logits rows (a split head, when wanted)

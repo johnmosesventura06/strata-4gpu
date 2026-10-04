@@ -1470,7 +1470,7 @@ int main(int argc, char** argv) {
     if (wo == nullptr) { std::fprintf(stderr, "strata generate: output.weight is missing\n"); return 1; }
     const int64_t n_vocab = wo->ne1;
     strata::core::NativeHead native_head;
-    std::unique_ptr<strata::core::SplitHead> split_head;
+    std::vector<std::unique_ptr<strata::core::SplitHead>> split_heads;   // PLAY-4GPU: one part per tier GPU
     if (!o.native_head_gguf.empty()) {
         std::vector<std::string> head_shards;
         try {
@@ -1485,26 +1485,33 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stderr, "strata generate: native head, type %d, %llu bytes\n", native_head.type(),
                      (unsigned long long) native_head.weight_bytes());
-        // the head's last rows on the second GPU (split_head.hpp): each GPU streams its part after the last layer.
-        // The drafter gathers its draft head's rows first; without one it needs the whole head here.
-        if (o.second_gpu >= 0 && o.head_split > 0.0 && o.head_split < 1.0 && o.spec >= 2) {
-            const int64_t split = (int64_t) ((1.0 - o.head_split) * (double) n_vocab) / 256 * 256;
-            auto sh = std::make_unique<strata::core::SplitHead>();
+        // the head's last rows split across the tier GPUs (split_head.hpp): each streams its part after the last
+        // layer, so no one card carries the head's streaming while the window waits on its flag. The drafter
+        // gathers its draft head's rows first; without one it needs the whole head here (PLAY-4GPU).
+        const int sh_parts = (int) std::min<size_t>(o.tier_gpus.size(), 3);
+        if (sh_parts > 0 && o.head_split > 0.0 && o.head_split < 1.0 && o.spec >= 2) {
+            const int64_t split0 = (int64_t) ((1.0 - o.head_split) * (double) n_vocab) / 256 * 256;
+            const int64_t sharded = n_vocab - split0;
+            const int64_t per = sharded / sh_parts / 256 * 256;
             std::string e2;
-            const bool ok = (o.mtp.empty() || mtp.bind_head(&native_head, e2)) &&
-                            (o.mtp.empty() || mtp.has_draft_head()) &&
-                            sh->init(o.second_gpu, o.main_gpu, head_shards, g.n_embd, n_vocab, split, o.max_window(),
-                                     e2) &&
-                            native_head.keep_rows(split, e2);
-            if (ok) {
-                std::fprintf(stderr, "strata generate: the head's rows %lld-%lld on the second GPU (%.0f MiB), the "
-                                     "first %lld here\n", (long long) split, (long long) n_vocab,
-                             (double) sh->bytes() / 1048576.0, (long long) split);
-                split_head = std::move(sh);
-            } else {
-                std::fprintf(stderr, "strata generate: the head stays on the main GPU: %s\n",
-                             e2.empty() ? "the draft layer has no draft head of its own" : e2.c_str());
+            bool ok = per > 0 && (o.mtp.empty() || (mtp.bind_head(&native_head, e2) && mtp.has_draft_head()));
+            std::vector<std::unique_ptr<strata::core::SplitHead>> built;
+            for (int i = 0; ok && i < sh_parts; ++i) {
+                const int64_t lo = split0 + per * i;
+                const int64_t hi = (i + 1 == sh_parts) ? n_vocab : split0 + per * (i + 1);
+                auto sh = std::make_unique<strata::core::SplitHead>();
+                ok = sh->init(o.tier_gpus[i], o.main_gpu, head_shards, g.n_embd, n_vocab, lo, o.max_window(), e2, hi);
+                if (ok) {
+                    std::fprintf(stderr, "strata generate: the head's rows %lld-%lld on GPU %d (%.0f MiB)\n",
+                                 (long long) lo, (long long) hi, o.tier_gpus[i],
+                                 (double) sh->bytes() / 1048576.0);
+                    built.push_back(std::move(sh));
+                }
             }
+            if (ok) ok = native_head.keep_rows(split0, e2);
+            if (ok) split_heads = std::move(built);
+            else std::fprintf(stderr, "strata generate: the head stays on the main GPU: %s\n",
+                              e2.empty() ? "the draft layer has no draft head of its own" : e2.c_str());
         }
     }
     // ---- R4's slot storage.  Allocated AFTER the weights, the session and the head, so `cudaMemGetInfo` inside
@@ -2545,7 +2552,11 @@ int main(int argc, char** argv) {
         vh.slot_off = xcache.slot_offsets();
         vh.slots = xcache.slots();
         vh.blob = thits.blob;
-        ver.set_split_head(split_head.get());
+        {   // PLAY-4GPU: hand every head part to the verifier
+            strata::core::SplitHead* shp[3] = {};
+            for (size_t i = 0; i < split_heads.size(); ++i) shp[i] = split_heads[i].get();
+            ver.set_split_heads(shp, (int) split_heads.size());
+        }
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.max_window(), err) ||
             !mtp.bind(wt, &native_head, ver.final_R_all(), err)) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
@@ -3401,7 +3412,11 @@ int main(int argc, char** argv) {
         vh.slot_off = xcache.slot_offsets();
         vh.slots = xcache.slots();
         vh.blob = thits.blob;
-        ver.set_split_head(split_head.get());
+        {   // PLAY-4GPU: hand every head part to the verifier
+            strata::core::SplitHead* shp[3] = {};
+            for (size_t i = 0; i < split_heads.size(); ++i) shp[i] = split_heads[i].get();
+            ver.set_split_heads(shp, (int) split_heads.size());
+        }
         ver.set_logits_wanted(!o.window_logits.empty());
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.max_window(), err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
