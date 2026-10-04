@@ -420,7 +420,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             m.gemm.f16(b.mixed_h, Wk, b.Kc, P, 512, N);
             m.gemm.f16(b.mixed_h, Wv, b.Vc, P, 512, N);
             rms_rows(b.Kc, dk.k_norm, P * 2, 256, 256, EPS, m.cs);
-            rope(b.Kc, P, 2, 256, 512, pp, (float) strata::kernels::qsa_freq_base(), m.cs);
+            rope(b.Kc, P, 2, 256, 512, pp, strata::kernels::rope_scaling(), m.cs);
             append_kv(st, b.Kc, b.Vc, P, pp, s, m.cs);
         }
         return true;
@@ -648,13 +648,13 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         if (!bf16_proj(m.gemm, wik, b.mixed_bf, b.idx_raw, P, v.name("indexer.k_proj.weight"), err)) return false;
                         if (!bf16_proj(m.gemm, wiq, b.mixed_bf, b.q_idx, P, v.name("indexer.q_proj.weight"), err)) return false;
                         rms_rows(b.Kc, (const float*) wkn->data, P * 2, 256, 256, EPS, m.cs);
-                        rope(b.Kc, P, 2, 256, 512, pp, (float) strata::kernels::qsa_freq_base(), m.cs);
+                        rope(b.Kc, P, 2, 256, 512, pp, strata::kernels::rope_scaling(), m.cs);
                         append_kv(st, b.Kc, b.Vc, P, pp, s, m.cs);
                         split_q(b.Qf, b.q, P, m.cs);
                         rms_rows(b.q, (const float*) wqn->data, P * 24, 256, 256, EPS, m.cs);
-                        rope(b.q, P, 24, 256, 6144, pp, (float) strata::kernels::qsa_freq_base(), m.cs);
+                        rope(b.q, P, 24, 256, 6144, pp, strata::kernels::rope_scaling(), m.cs);
                         rms_rows(b.q_idx, (const float*) wiqn->data, P * 4, 128, 128, EPS, m.cs);
-                        rope(b.q_idx, P, 4, 128, 512, pp, (float) strata::kernels::qsa_freq_base(), m.cs);
+                        rope(b.q_idx, P, 4, 128, 512, pp, strata::kernels::rope_scaling(), m.cs);
                         // the indexer appends of the sub-chunk; then scores + selection for many queries at once:
                         // a query reads completed blocks (final once completed) and `dead` for its own tail block
                         const strata::kernels::QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
@@ -662,7 +662,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         try {
                             strata::kernels::native_qsa_indexer_append_multi(
                                 b.idx_raw, steps + strata::kernels::kStepPos, (int) SC, (int) P, 0,
-                                (const float*) wikn->data, EPS, ib, s, st.max_cells, (float) strata::kernels::qsa_freq_base(), m.cs);
+                                (const float*) wikn->data, EPS, ib, s, st.max_cells, strata::kernels::rope_scaling(), m.cs);
                         } catch (const std::exception& e) { err = std::string("prefill indexer: ") + e.what(); return false; }
                         mark(kPsQsaScores);
                         for (int64_t q0 = 0; q0 < P; q0 += SEL_BATCH) {

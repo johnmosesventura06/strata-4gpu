@@ -18,6 +18,7 @@
 #include "strata/core/adaptive_tier.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/second_gpu.hpp"
+#include "strata/kernels/rope_scaling.hpp"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -114,7 +115,18 @@ struct Options {
     bool native_flash_attn_short = false; // diagnostic pinned attention, context <=256
     bool native_qsa_indexer = false;  // pinned F16 key cache and F32 pooling
     bool native_qsa = false;          // pinned F32 QSA norms and gate
-    bool native_rope = false;         // pinned text-only CUDA rotary arithmetic
+    bool native_rope = false;
+    /// rope scaling past the trained 262K (ported from upstream main, trimmed to the CLI: the artifacts ship
+    /// no rope.scaling keys). Process constant, resolved once before session_init and any graph capture.
+    std::string rope_scaling;                    ///< --rope-scaling none|linear|yarn
+    double rope_scale = 0;                       ///< --rope-scale F (0 = absent; must be >= 1 when given)
+    double rope_freq_base = 0;                   ///< --rope-freq-base N (0 = 1e7)
+    double rope_freq_scale = 0;                  ///< --rope-freq-scale F (0 = 1/factor)
+    double yarn_orig_ctx = 0;                    ///< --yarn-orig-ctx N (0 = 262144)
+    double yarn_ext_factor = -1.0;               ///< --yarn-ext-factor F (<0 = auto: 1 for yarn, else 0)
+    double yarn_attn_factor = 1.0;               ///< --yarn-attn-factor F
+    double yarn_beta_fast = 32.0;                ///< --yarn-beta-fast F
+    double yarn_beta_slow = 1.0;                 ///< --yarn-beta-slow F         // pinned text-only CUDA rotary arithmetic
     bool native_ple_postops = false;  // pinned PLE postprojection arithmetic
     bool native_router = false;       // pinned fused 512-expert top-10 router
     bool cpu_oracle_q8_0 = false;      // pinned x86 activation scales/codes at both expert stages
@@ -324,6 +336,13 @@ void usage() {
                  "  --native-qsa-indexer  experimental pinned indexer key cache and pooling\n"
                  "  --native-qsa          experimental pinned QSA normalization and output gate\n"
                  "  --native-rope         experimental pinned text-only CUDA rotary arithmetic\n"
+                 "  --rope-scaling T     extend the context past the trained one: none, linear (position\n"
+                 "                       interpolation) or yarn. Fixed at startup: K in the cache is post-RoPE,\n"
+                 "                       so one run uses one scaling.\n"
+                 "  --rope-scale F       the extension factor (>= 1), e.g. 2 for 524288 over a 262144 training run\n"
+                 "  --rope-freq-base N   the rotation base (0 = 1e7)   --rope-freq-scale F  the raw shrink (0 = 1/F)\n"
+                 "  --yarn-orig-ctx N    trained context (0 = 262144)  --yarn-ext-factor F  <0 = auto (1 for yarn)\n"
+                 "  --yarn-attn-factor F --yarn-beta-fast F --yarn-beta-slow F  the remaining YaRN knobs\n"
                  "  --native-ple-postops  experimental pinned PLE postprojection arithmetic\n"
                  "  --native-router       experimental pinned CUDA 512-expert top-10 routing\n"
                  "  --cpu-oracle-q8-0     experimental pinned CPU expert quantization and dot reduction\n"
@@ -880,6 +899,15 @@ int main(int argc, char** argv) {
         else if (a == "--native-qsa-indexer") o.native_qsa_indexer = true;
         else if (a == "--native-qsa") o.native_qsa = true;
         else if (a == "--native-rope") o.native_rope = true;
+        else if (a == "--rope-scaling") o.rope_scaling = next("--rope-scaling");
+        else if (a == "--rope-scale") o.rope_scale = std::atof(next("--rope-scale"));
+        else if (a == "--rope-freq-base") o.rope_freq_base = std::atof(next("--rope-freq-base"));
+        else if (a == "--rope-freq-scale") o.rope_freq_scale = std::atof(next("--rope-freq-scale"));
+        else if (a == "--yarn-orig-ctx") o.yarn_orig_ctx = std::atof(next("--yarn-orig-ctx"));
+        else if (a == "--yarn-ext-factor") o.yarn_ext_factor = std::atof(next("--yarn-ext-factor"));
+        else if (a == "--yarn-attn-factor") o.yarn_attn_factor = std::atof(next("--yarn-attn-factor"));
+        else if (a == "--yarn-beta-fast") o.yarn_beta_fast = std::atof(next("--yarn-beta-fast"));
+        else if (a == "--yarn-beta-slow") o.yarn_beta_slow = std::atof(next("--yarn-beta-slow"));
         else if (a == "--native-ple-postops") o.native_ple_postops = true;
         else if (a == "--native-router") o.native_router = true;
         else if (a == "--cpu-oracle-q8-0") o.cpu_oracle_q8_0 = true;
@@ -1265,6 +1293,64 @@ int main(int argc, char** argv) {
     if (cudaMalloc(&sbuf, strata::core::session_bytes(g, o.max_context, K)) != cudaSuccess) {
         std::fprintf(stderr, "strata generate: session state allocation failed\n");
         return 1;
+    }
+    // ---- rope scaling resolution (upstream main's block, trimmed to the CLI: no gguf rope keys exist in
+    // these artifacts). Validate as a whole, then set the process constants: session_init builds the rope
+    // tables from them, and captured graphs bake the analytic kernels' arguments.
+    strata::kernels::RopeScaling rope_cfg;
+    {
+        using RST = strata::kernels::RopeScalingType;
+        if (o.rope_scaling == "none") rope_cfg.type = RST::None;
+        else if (o.rope_scaling == "linear") rope_cfg.type = RST::Linear;
+        else if (o.rope_scaling == "yarn") rope_cfg.type = RST::YaRN;
+        else if (!o.rope_scaling.empty()) {
+            std::fprintf(stderr, "strata generate: --rope-scaling must be none, linear or yarn (got '%s')\n",
+                         o.rope_scaling.c_str());
+            return 2;
+        }
+        for (const double v : {o.rope_scale, o.rope_freq_base, o.rope_freq_scale, o.yarn_orig_ctx,
+                               o.yarn_ext_factor, o.yarn_attn_factor, o.yarn_beta_fast, o.yarn_beta_slow})
+            if (!std::isfinite(v)) {
+                std::fprintf(stderr, "strata generate: a rope scaling knob is not a finite number (%g)\n", v);
+                return 2;
+            }
+        if (o.rope_scale != 0 && o.rope_scale < 1.0) {
+            std::fprintf(stderr, "strata generate: --rope-scale %g must be >= 1 (it extends the context)\n",
+                         o.rope_scale);
+            return 2;
+        }
+        if (o.rope_freq_base != 0 && o.rope_freq_base <= 1.0) {
+            std::fprintf(stderr, "strata generate: --rope-freq-base must be a base above 1 (0 = 1e7)\n");
+            return 2;
+        }
+        if (o.rope_freq_scale < 0 || o.yarn_orig_ctx < 0 || o.yarn_ext_factor < -1.0 || o.yarn_attn_factor <= 0 ||
+            o.yarn_beta_fast <= 0 || o.yarn_beta_slow <= 0) {
+            std::fprintf(stderr, "strata generate: invalid rope scaling knob (see usage)\n");
+            return 2;
+        }
+        if (o.rope_scale > 0) rope_cfg.factor = o.rope_scale;
+        if (o.rope_freq_base > 0) rope_cfg.freq_base = o.rope_freq_base;
+        if (o.yarn_orig_ctx > 0) rope_cfg.orig_ctx = o.yarn_orig_ctx;
+        rope_cfg.freq_scale_in = o.rope_freq_scale;
+        rope_cfg.ext_factor = o.yarn_ext_factor >= 0 ? o.yarn_ext_factor
+                                                     : (rope_cfg.type == RST::YaRN ? 1.0 : 0.0);
+        rope_cfg.attn_factor = o.yarn_attn_factor;
+        rope_cfg.beta_fast = o.yarn_beta_fast;
+        rope_cfg.beta_slow = o.yarn_beta_slow;
+        if (const char* why = strata::kernels::rope_scaling_invalid(rope_cfg)) {
+            std::fprintf(stderr, "strata generate: invalid rope scaling configuration: %s (factor %g, base %g, "
+                                 "original context %g)\n", why, rope_cfg.factor, rope_cfg.freq_base, rope_cfg.orig_ctx);
+            return 2;
+        }
+        if ((rope_cfg.type != RST::None || o.rope_scaling == "none") && o.max_context > rope_cfg.orig_ctx) {
+            const char* tn = rope_cfg.type == RST::YaRN ? "yarn" : rope_cfg.type == RST::Linear ? "linear" : "none";
+            std::fprintf(stderr, "strata generate: rope scaling %s, factor %.6g (freq_scale %.6g, mscale %.6f), "
+                                 "--max-context %lld against a trained context of %.0f\n", tn, rope_cfg.factor,
+                         rope_cfg.freq_scale(), rope_cfg.mscale(), (long long) o.max_context, rope_cfg.orig_ctx);
+        }
+        if (rope_cfg.type == RST::None && (o.rope_scale > 1.0 || o.rope_freq_scale > 0 || o.yarn_ext_factor > 0))
+            std::fprintf(stderr, "strata generate: note: --rope-scaling none, so the scaling knobs have no effect\n");
+        strata::kernels::rope_scaling_set(rope_cfg);
     }
     strata::core::SessionState ss;
     // **THE ENGINE RAN ON THE LEGACY DEFAULT STREAM, WHICH ON WDDM IS THE SLOW PATH.**  All four session

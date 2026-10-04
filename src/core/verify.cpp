@@ -668,7 +668,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 auto norm_rope = [&](const float* in, int stride, float* out, const WeightRef* norm, int heads,
                                      int cols, cudaStream_t ns) {
                     native_qsa_norm_rope_tokens(in, stride, (const float*) norm->data, out, cols, n * heads, EPS,
-                                                (int) s.n_rot, (float) qsa_freq_base(), pos_ + tb * NH, heads, (int) NH,
+                                                (int) s.n_rot, rope_scaling(), pos_ + tb * NH, heads, (int) NH,
                                                 ns);
                 };
                 // three branches beside the values, joined before the attention: the indexer (its key and query
@@ -684,7 +684,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
                 native_qsa_indexer_append_multi(idx_raw + tb * ID, step_ + tb * kStepCount + kStepPos, (int) kStepCount, n,
                                                 0, (const float*) wikn->data, EPS, ib, s, st.max_cells,
-                                                (float) qsa_freq_base(), side_,
+                                                rope_scaling(), side_,
                                                 grp == 0 ? tail_snap_ + (size_t) qi * TS : nullptr);
                 norm_rope(qidx_ + tb * IQ * ID, (int) ID, qidx_ + tb * IQ * ID, wiqn, (int) IQ, (int) ID, side_);
                 qsa_block_scores(st.idx_pooled, st.idx_dead, qidx_ + tb * IQ * ID, step_ + tb * kStepCount, n, max_blocks_,
@@ -1084,7 +1084,7 @@ bool Verifier::capture_commit(std::string& err) {
                 const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
                 native_qsa_indexer_append_multi(idx_raw_L_ + (size_t) (qsa_index * MT) * ID, commit_ + 2, 1, (int) MT, 0,
                                                 (const float*) wikn->data, EPS, ib, s, st.max_cells,
-                                                (float) qsa_freq_base(), cs_);
+                                                rope_scaling(), cs_);
                 ++qsa_index;
             }
         }
