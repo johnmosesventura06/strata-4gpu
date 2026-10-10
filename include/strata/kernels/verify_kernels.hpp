@@ -102,6 +102,9 @@ void argmax_rows(const float* logits, int n_rows, int n, void* scratch, int32_t*
 void mapped_bump(uint32_t* flag, void* stream);
 /// dst row t (n floats) = a row t (na floats) then b row t (n - na floats), for `rows` rows.
 void join_rows(float* dst, int64_t n, const float* a, int64_t na, const float* b, int rows, void* stream);
+
+/// PLAY-4GPU: one segment join — dst rows of width `n` take [lo, hi) from src rows of width `nsrc` (mapped read).
+void join_range(float* dst, int64_t n, const float* src, int64_t lo, int64_t hi, int64_t nsrc, int rows, void* stream);
 /// row_top_prob over 8 blocks a row, each computing 4 of its 32 warps' sums, the row's last block adding the 32 in
 /// order: bitwise row_top_prob.  `scratch`: row_top_prob_scratch_bytes(n_rows), zero before the first launch.
 uint64_t row_top_prob_scratch_bytes(int n_rows);

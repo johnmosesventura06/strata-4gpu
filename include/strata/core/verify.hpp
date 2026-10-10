@@ -119,8 +119,13 @@ public:
     /// The head's logits of the last window's first `T` tokens, T * n_vocab floats, copied to host memory `out`.
     bool copy_logits(int T, float* out, std::string& err) const;
     /// The head's rows [split, n_vocab) on another GPU (`head` then holds rows [0, split)): the window hands the head's
-    /// input over, and `run` keeps each token's larger pick.  Set before `init`.
-    void set_split_head(SplitHead* sh) { shead_ = sh; }
+    /// input over, and `run` keeps each token's larger pick.  Set before `init`.  PLAY-4GPU: up to three parts, their
+    /// ranges contiguous from the main head's rows to n_vocab (set_split_heads).
+    void set_split_head(SplitHead* sh) { sheads_[0] = sh; n_shead_ = sh != nullptr ? 1 : 0; }
+    void set_split_heads(SplitHead* const* arr, int n) {
+        n_shead_ = n > 3 ? 3 : n;
+        for (int i = 0; i < 3; ++i) sheads_[i] = i < n_shead_ ? arr[i] : nullptr;
+    }
     /// Whole logits rows after every window (copy_logits, --window-logits): with a split head the second GPU's part
     /// then copies its rows back.  Set before `init`.
     void set_logits_wanted(bool on) { logits_wanted_ = on; }
@@ -159,10 +164,12 @@ public:
     /// host.  Set before the first `run`.
     void set_rows_in(RowsFn fn, void* user) { rows_in_ = fn; rows_user_ = user; }
     cudaEvent_t window_done() const { return done_; }
-    /// The pool gives a second GPU a share of each layer (`GpuPlanSink::gpu2_flag`): it writes its rows into the
-    /// pool's rows and raises its token group's flag, and a branch of the window, forked at the ring, takes them
-    /// into VRAM while the CPU works.  Set before the first `run`.
-    void set_gpu2(bool on) { gpu2_ = on; }
+    /// The pool gives tier GPUs a share of each layer (`GpuPlanSink::tier_flag`): each writes its rows into the
+    /// pool's rows and raises its token group's flag (one flag line per (group, tier)), and a branch of the window,
+    /// forked at the ring, waits for ALL the tiers' flags, then takes the merged entry list into VRAM while the CPU
+    /// works.  Set before the first `run`.  PLAY-4GPU: `n` tiers (0 off); set_gpu2 stays for the single-tier call.
+    void set_gpu2(bool on) { gpu2_ = on; ntiers_ = on ? 1 : 0; }
+    void set_tiers(int n) { gpu2_ = n > 0; ntiers_ = n; }
     /// `fn` is asked every ~2 ms while the host waits for a ring: on failure the window's waits are released and `run`
     /// returns the reason.  Set before the first `run`.
     void set_watch(WatchFn fn, void* user) { watch_ = fn; watch_user_ = user; }
@@ -211,7 +218,9 @@ private:
     float* h_ple_ = nullptr;     float* m_ple_ = nullptr;       // T * n_embd
     int32_t* h_out_ = nullptr;   int32_t* m_out_ = nullptr;     // T argmax ids
     float* h_val_ = nullptr;     float* m_val_ = nullptr;       // their logits (a split head's merge)
-    SplitHead* shead_ = nullptr;
+    SplitHead* sheads_[3] = {};                        // PLAY-4GPU: contiguous head parts on the tier GPUs
+    int n_shead_ = 0;
+    SplitHead*& shead_ = sheads_[0];                   // the single-part name the original code paths use
     bool logits_wanted_ = false;
     int64_t head_rows_ = 0;                                     // the head's rows here: n_vocab, or the split
     float* head_full_ = nullptr;                                // T whole logits rows (a split head, when wanted)
@@ -252,9 +261,10 @@ private:
     int64_t xk_stride_ = 0;
     uint8_t* h_xk_ = nullptr;    uint8_t* m_xk_ = nullptr;      // T rows
     uint8_t* h_xq1_ = nullptr;   uint8_t* m_xq1_ = nullptr;     // T rows of n_embd / 32 blocks
-    // the second GPU's share (set_gpu2), per token group: the flag it raises (64 bytes apart) and its entries,
-    // [n, pad x3, entries] (mapped; `list2_` their device copies, which the combine reads)
+    // the tiers' share (set_tiers), per token group x tier: the flag each raises (64-byte lines, (grp * ntiers_ + t)
+    // * 16) and the MERGED entries, [n, pad x3, entries] (mapped; `list2_` their device copies, which the combine reads)
     bool gpu2_ = false;
+    int ntiers_ = 0;
     uint32_t* h_flag2_ = nullptr; uint32_t* m_flag2_ = nullptr;
     int32_t* h_list2_ = nullptr; int32_t* m_list2_ = nullptr;
     int32_t* list2_ = nullptr;

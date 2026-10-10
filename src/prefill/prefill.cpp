@@ -61,7 +61,7 @@ struct Bufs {
     // the chunk's: residual stream, the MoE's input (FP16) and output, the FFN half's injection, routing, steps, PLE
     // rows, the second GPU's sums (FP16)
     float *R = nullptr, *bo_moe = nullptr, *inj_f = nullptr, *w = nullptr, *ple_emb = nullptr;
-    uint16_t *mixed_h = nullptr, *sums = nullptr;
+    uint16_t *mixed_h = nullptr, *sums[3] = {};   // PLAY-4GPU: one remote-sum staging per offload runner
     int32_t *ids = nullptr, *steps = nullptr;
     // a sub-chunk's: the mixer's BF16 input, its output, the mixer half's injection, a read's row scales
     uint16_t* mixed_bf = nullptr;
@@ -86,7 +86,7 @@ struct Bufs {
 // Chunks of T tokens: the chunk-long buffers, the sub-chunk ones, then the union of the steps a layer takes one after
 // the other on the stream.  (Staging copies run ahead on a copy stream only while the routed experts run, after the
 // host has waited for the stream, and the stream waits for them before the next step.)
-Bufs layout(Alloc& a, int64_t T, int64_t cap, int64_t max_blocks, bool offload) {
+Bufs layout(Alloc& a, int64_t T, int64_t cap, int64_t max_blocks, int n_off) {
     const size_t t = (size_t) T, p = (size_t) std::min(T, SUB);
     Bufs b;
     b.w16 = a.take<uint16_t>((size_t) W16);
@@ -99,7 +99,7 @@ Bufs layout(Alloc& a, int64_t T, int64_t cap, int64_t max_blocks, bool offload) 
     b.w = a.take<float>(t * K);
     b.steps = a.take<int32_t>(t * strata::kernels::kStepCount);
     b.ple_emb = a.take<float>(t * N);
-    b.sums = offload ? a.take<uint16_t>(t * N) : nullptr;   // read by the next layer's sub-chunks
+    for (int j = 0; j < n_off; ++j) b.sums[j] = a.take<uint16_t>(t * N);   // read by the next layer's sub-chunks
     b.mixed_bf = a.take<uint16_t>(p * N);
     b.bo = a.take<float>(p * N);
     b.inj_a = a.take<float>(p * HC);
@@ -127,7 +127,7 @@ Bufs layout(Alloc& a, int64_t T, int64_t cap, int64_t max_blocks, bool offload) 
     b.logits = a.take<float>(p * NE); b.sgate = a.take<float>(p * 640); b.sup = a.take<float>(p * 640);
     b.sh_h = a.take<uint16_t>(p * 640); b.sg = a.take<float>(p);
     next();   // the routed experts
-    b.local_bytes = ExpertRunner::bytes_needed(T, NE, false, !offload);
+    b.local_bytes = ExpertRunner::bytes_needed(T, NE, false, n_off == 0);
     b.local = a.take<uint8_t>(b.local_bytes);
     next();
     a.used = u1;
@@ -168,7 +168,9 @@ struct Prefill::Impl {
     core::SessionState* ss = nullptr;
     const core::ExpertCache* cache = nullptr;
     const int32_t* host_res = nullptr;
-    ExpertRunner* offload = nullptr;
+    std::vector<ExpertRunner*> runners;       // PLAY-4GPU: one per tier GPU, <= 3 (not m.off: the offsets' name)
+    std::vector<const int32_t*> off_res;      // ...and each one's residency table
+    int n_off = 0;
     ExpertRunner local;
     int64_t max_chunk = 0, T = 0;   // T: the chunk the buffers are bound for
     strata::kernels::QsaShapes s;
@@ -177,7 +179,7 @@ struct Prefill::Impl {
     // the second GPU's share, a sub-chunk at a time: the input goes out on `xfer`, the sums come back on `xsum`
     cudaStream_t xfer = nullptr, xsum = nullptr;
     cudaEvent_t ev_mixed = nullptr;
-    std::vector<cudaEvent_t> ev_in, ev_piece;   // a sub-chunk's input is in host memory, its sums on this GPU
+    std::vector<cudaEvent_t> ev_in, ev_piece;   // runner-major flat: index j * pieces + piece
     Gemm gemm;
     void* owned = nullptr;   // the buffers' own allocation (no region)
     Bufs b;
@@ -186,8 +188,10 @@ struct Prefill::Impl {
     int32_t* ids_host = nullptr;   // pinned [max_chunk, K]
     float* w_host = nullptr;
     std::vector<int32_t> steps_host, cnt, off, entry_of;
-    std::vector<int32_t> ex1, off1, src1, ex2, off2, src2;   // this GPU's experts, the second GPU's
-    std::vector<float> w1, w2;
+    std::vector<int32_t> ex1, off1, src1;      // this GPU's experts
+    std::vector<std::vector<int32_t>> ex2, off2, src2;   // PLAY-4GPU: each offload runner's share
+    std::vector<float> w1;
+    std::vector<std::vector<float>> w2;
     // a chunk's PLE rows, read on a thread while the chunk before runs: two pinned buffers, their row indices
     float* ple_host[2] = {};
     std::vector<uint32_t> ple_rows[2];
@@ -213,9 +217,11 @@ Prefill::~Prefill() {
 
 bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, core::SessionState& ss,
                    core::ExpertSource* src, const core::ExpertCache* cache, const int32_t* host_res, int64_t max_chunk,
-                   void* stream, ExpertRunner* offload, std::string& err) {
+                   void* stream, const std::vector<ExpertRunner*>& offload,
+                   const std::vector<const int32_t*>& off_res, std::string& err) {
     Impl& m = *impl_;
-    m.wt = &wt; m.g = &g; m.ss = &ss; m.cache = cache; m.host_res = host_res; m.offload = offload;
+    m.wt = &wt; m.g = &g; m.ss = &ss; m.cache = cache; m.host_res = host_res;
+    m.runners = offload; m.off_res = off_res; m.n_off = (int) offload.size();
     m.max_chunk = max_chunk; m.cs = (cudaStream_t) stream;
     if (g.n_embd != N || g.hc != HC || g.hc_lr != LR || g.n_expert != NE || ss.k != K) {
         err = "prefill: geometry differs from the artifact's"; return false;
@@ -223,8 +229,9 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     m.s = shapes_of(g);
     m.cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, m.s);
     m.max_blocks = ss.qsa_states[0].max_cells / m.s.idx_block + 2;
-    m.ev_in.assign((size_t) ((max_chunk + SUB - 1) / SUB), nullptr);
-    m.ev_piece.assign(m.ev_in.size(), nullptr);
+    const size_t nev = (size_t) ((max_chunk + SUB - 1) / SUB) * (size_t) std::max(1, m.n_off);
+    m.ev_in.assign(nev, nullptr);
+    m.ev_piece.assign(nev, nullptr);
     bool pieces = true;
     for (auto* v : {&m.ev_in, &m.ev_piece})
         for (cudaEvent_t& e : *v)
@@ -239,6 +246,8 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     }
     const size_t T = (size_t) max_chunk;
     m.steps_host.resize(T * strata::kernels::kStepCount);
+    m.ex2.resize((size_t) std::max(1, m.n_off)); m.off2.resize((size_t) std::max(1, m.n_off));
+    m.src2.resize((size_t) std::max(1, m.n_off)); m.w2.resize((size_t) std::max(1, m.n_off));
     m.cnt.resize(NE);
     m.off.resize(NE + 1);
     m.entry_of.resize(T * K);
@@ -252,21 +261,21 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     int dev = 0;
     cudaGetDevice(&dev);
     return m.gemm.init(stream, err) &&
-           m.local.init(dev, dev, stream, src, cache, host_res, NE, max_chunk, offload == nullptr, err);
+           m.local.init(dev, dev, stream, src, cache, host_res, NE, max_chunk, offload.empty(), err);
 }
 
-uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk, bool offload) {
+uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk, int n_off) {
     const strata::kernels::QsaShapes s = shapes_of(g);
     Alloc a;
     layout(a, chunk, strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s),
-           ss.qsa_states[0].max_cells / s.idx_block + 2, offload);
+           ss.qsa_states[0].max_cells / s.idx_block + 2, n_off);
     return a.used;
 }
 
 uint64_t Prefill::bytes_for(int64_t chunk) const {
     const Impl& m = *impl_;
-    return bytes_needed(*m.g, *m.ss, chunk, m.offload != nullptr) +
-           (m.offload == nullptr && chunk >= ExpertRunner::kPrefetchMin ? m.local.prefetch_need(nullptr) : 0);
+    return bytes_needed(*m.g, *m.ss, chunk, m.n_off) +
+           (m.runners.empty() && chunk >= ExpertRunner::kPrefetchMin ? m.local.prefetch_need(nullptr) : 0);
 }
 
 bool Prefill::bind(void* region, uint64_t bytes, int64_t chunk, std::string& err) {
@@ -274,7 +283,7 @@ bool Prefill::bind(void* region, uint64_t bytes, int64_t chunk, std::string& err
     if (region == nullptr) {
         if (m.owned != nullptr) return true;   // allocated once, for the longest chunk
         chunk = m.max_chunk;
-        bytes = bytes_needed(*m.g, *m.ss, chunk, m.offload != nullptr);
+        bytes = bytes_needed(*m.g, *m.ss, chunk, m.n_off);
         if (cudaMalloc(&m.owned, bytes) != cudaSuccess) {
             m.owned = nullptr;
             err = "prefill: " + std::to_string(bytes >> 20) + " MiB of device buffers";
@@ -289,7 +298,7 @@ bool Prefill::bind(void* region, uint64_t bytes, int64_t chunk, std::string& err
     Alloc a;
     a.base = (uint8_t*) region;
     a.cap = bytes;
-    m.b = layout(a, chunk, m.cap, m.max_blocks, m.offload != nullptr);
+    m.b = layout(a, chunk, m.cap, m.max_blocks, m.n_off);
     if (!a.ok) {
         err = "prefill: device buffers for a chunk of " + std::to_string(chunk) + " tokens do not fit";
         return false;
@@ -411,7 +420,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             m.gemm.f16(b.mixed_h, Wk, b.Kc, P, 512, N);
             m.gemm.f16(b.mixed_h, Wv, b.Vc, P, 512, N);
             rms_rows(b.Kc, dk.k_norm, P * 2, 256, 256, EPS, m.cs);
-            rope(b.Kc, P, 2, 256, 512, pp, (float) strata::kernels::qsa_freq_base(), m.cs);
+            rope(b.Kc, P, 2, 256, 512, pp, strata::kernels::rope_scaling(), m.cs);
             append_kv(st, b.Kc, b.Vc, P, pp, s, m.cs);
         }
         return true;
@@ -481,15 +490,21 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         // a sub-chunk at a time while this GPU works on the sub-chunks before (with `norm`, the next read's norm in
         // the same pass)
         bool pending = false;
+        bool pending_share[3] = {false, false, false};   // which runners had a share in the layer being written
         auto ffn_write = [&](int64_t t0, int64_t P, const float* norm) {
-            const uint16_t* part = nullptr;
-            if (m.offload) {
-                cudaStreamWaitEvent(m.cs, m.ev_piece[(size_t) (t0 / SUB)], 0);
-                part = b.sums + t0 * N;
+            const uint16_t* parts[3] = {};
+            int np = 0;
+            if (pending) {   // PLAY-4GPU: wait each sharing runner's piece, then add each of its sums
+                const size_t pieces = (size_t) ((T + SUB - 1) / SUB);
+                for (int j = 0; j < m.n_off; ++j) {
+                    if (!pending_share[j]) continue;
+                    cudaStreamWaitEvent(m.cs, m.ev_piece[(size_t) j * pieces + (size_t) (t0 / SUB)], 0);
+                    parts[np++] = b.sums[j] + t0 * N;
+                }
             }
             float *R = b.R + t0 * D, *bo = b.bo_moe + t0 * N, *inj = b.inj_f + t0 * HC;
-            if (norm) gr_write_norm_rs(R, bo, inj, HC, norm, EPS, b.rs, b.xn16, P, m.cs, part);
-            else gr_write(R, bo, inj, HC, P, m.cs, part);
+            if (norm) gr_write_norm_rs(R, bo, inj, HC, norm, EPS, b.rs, b.xn16, P, m.cs, np ? parts : nullptr, np);
+            else gr_write(R, bo, inj, HC, P, m.cs, np ? parts : nullptr, np);
         };
         int64_t qsa_index = 0, gdn_index = 0;
         for (int64_t l = 0; l < g.n_layers; ++l) {
@@ -500,9 +515,23 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             // the dense steps run, or on the second GPU
             if (T >= ExpertRunner::kPrefetchMin) {
                 m.ex1.clear();
-                for (int32_t e = 0; e < NE; ++e)
-                    if (!(m.host_res && m.cache && m.host_res[(size_t) l * NE + e] >= 0)) m.ex1.push_back(e);
-                if (!(m.offload ? m.offload : &m.local)->prefetch(l, m.ex1, err)) return false;
+                if (m.runners.empty()) {
+                    for (int32_t e = 0; e < NE; ++e)
+                        if (!(m.host_res && m.cache && m.host_res[(size_t) l * NE + e] >= 0)) m.ex1.push_back(e);
+                    if (!m.local.prefetch(l, m.ex1, err)) return false;
+                } else {   // PLAY-4GPU: each runner prefetches the experts of its share that its own cache lacks
+                    std::vector<std::vector<int32_t>> cand((size_t) m.n_off);
+                    for (int32_t e = 0; e < NE; ++e) {
+                        if (m.host_res && m.cache && m.host_res[(size_t) l * NE + e] >= 0) continue;
+                        int own = -1;
+                        for (int j = 0; j < m.n_off && own < 0; ++j)
+                            if (m.off_res[(size_t) j] && m.off_res[(size_t) j][(size_t) l * NE + e] >= 0) own = j;
+                        if (own < 0) own = (int) (((uint32_t) e * 2654435761u) >> 20) % m.n_off;   // unheld: spread
+                        cand[(size_t) own].push_back(e);
+                    }
+                    for (int j = 0; j < m.n_off; ++j)
+                        if (!m.runners[(size_t) j]->prefetch(l, cand[(size_t) j], err)) return false;
+                }
             }
             mark(kPsPle);
             // ---- the PLE block at layer 1: the key and value projections, then the decode path's per-token
@@ -619,13 +648,13 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         if (!bf16_proj(m.gemm, wik, b.mixed_bf, b.idx_raw, P, v.name("indexer.k_proj.weight"), err)) return false;
                         if (!bf16_proj(m.gemm, wiq, b.mixed_bf, b.q_idx, P, v.name("indexer.q_proj.weight"), err)) return false;
                         rms_rows(b.Kc, (const float*) wkn->data, P * 2, 256, 256, EPS, m.cs);
-                        rope(b.Kc, P, 2, 256, 512, pp, (float) strata::kernels::qsa_freq_base(), m.cs);
+                        rope(b.Kc, P, 2, 256, 512, pp, strata::kernels::rope_scaling(), m.cs);
                         append_kv(st, b.Kc, b.Vc, P, pp, s, m.cs);
                         split_q(b.Qf, b.q, P, m.cs);
                         rms_rows(b.q, (const float*) wqn->data, P * 24, 256, 256, EPS, m.cs);
-                        rope(b.q, P, 24, 256, 6144, pp, (float) strata::kernels::qsa_freq_base(), m.cs);
+                        rope(b.q, P, 24, 256, 6144, pp, strata::kernels::rope_scaling(), m.cs);
                         rms_rows(b.q_idx, (const float*) wiqn->data, P * 4, 128, 128, EPS, m.cs);
-                        rope(b.q_idx, P, 4, 128, 512, pp, (float) strata::kernels::qsa_freq_base(), m.cs);
+                        rope(b.q_idx, P, 4, 128, 512, pp, strata::kernels::rope_scaling(), m.cs);
                         // the indexer appends of the sub-chunk; then scores + selection for many queries at once:
                         // a query reads completed blocks (final once completed) and `dead` for its own tail block
                         const strata::kernels::QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
@@ -633,7 +662,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         try {
                             strata::kernels::native_qsa_indexer_append_multi(
                                 b.idx_raw, steps + strata::kernels::kStepPos, (int) SC, (int) P, 0,
-                                (const float*) wikn->data, EPS, ib, s, st.max_cells, (float) strata::kernels::qsa_freq_base(), m.cs);
+                                (const float*) wikn->data, EPS, ib, s, st.max_cells, strata::kernels::rope_scaling(), m.cs);
                         } catch (const std::exception& e) { err = std::string("prefill indexer: ") + e.what(); return false; }
                         mark(kPsQsaScores);
                         for (int64_t q0 = 0; q0 < P; q0 += SEL_BATCH) {
@@ -661,13 +690,15 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                      m.cs);
                 }
                 // ---- the FFN half's input is ready: its trip to the second GPU starts here
-                if (m.offload) {
+                if (m.n_off > 0) {   // PLAY-4GPU: every runner sees every sub-chunk's input (routing comes later)
                     cudaEventRecord(m.ev_mixed, m.cs);
                     cudaStreamWaitEvent(m.xfer, m.ev_mixed, 0);
-                    cudaMemcpyAsync(m.offload->host_input() + t0 * N, mixed_h, (size_t) P * N * 2,
-                                    cudaMemcpyDeviceToHost, m.xfer);
-                    cudaEventRecord(m.ev_in[(size_t) (t0 / SUB)], m.xfer);
-                    m.offload->stage_input(t0, P, m.ev_in[(size_t) (t0 / SUB)]);
+                    for (int j = 0; j < m.n_off; ++j)
+                        cudaMemcpyAsync(m.runners[(size_t) j]->host_input() + t0 * N, mixed_h, (size_t) P * N * 2,
+                                        cudaMemcpyDeviceToHost, m.xfer);
+                    cudaEventRecord(m.ev_in[(size_t) (t0 / SUB)], m.xfer);   // one gate: the copies went out in order
+                    for (int j = 0; j < m.n_off; ++j)
+                        m.runners[(size_t) j]->stage_input(t0, P, m.ev_in[(size_t) (t0 / SUB)]);
                 }
                 // ---- the router, and the shared expert (its gated output starts the MoE sum)
                 mark(kPsRouter);
@@ -705,39 +736,53 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 std::vector<int32_t> fill(m.off.begin(), m.off.end() - 1);
                 for (int64_t i = 0; i < T * K; ++i) m.entry_of[(size_t) fill[(size_t) m.ids_host[i]]++] = (int32_t) i;
             }
-            for (auto* v2 : {&m.ex1, &m.src1, &m.ex2, &m.src2}) v2->clear();
+            for (auto* v2 : {&m.ex1, &m.src1}) v2->clear();
+            for (int j = 0; j < m.n_off; ++j) { m.ex2[(size_t) j].clear(); m.src2[(size_t) j].clear(); }
             m.w1.clear();
-            m.w2.clear();
+            for (int j = 0; j < m.n_off; ++j) m.w2[(size_t) j].clear();
             m.off1.assign(1, 0);
-            m.off2.assign(1, 0);
+            for (int j = 0; j < m.n_off; ++j) m.off2[(size_t) j].assign(1, 0);
+            bool has_share[3] = {false, false, false};
             for (int32_t e = 0; e < NE; ++e) {
                 if (m.cnt[(size_t) e] == 0) continue;
-                const bool here = !m.offload || (m.host_res && m.cache && m.host_res[(size_t) l * NE + e] >= 0);
-                std::vector<int32_t>& ex = here ? m.ex1 : m.ex2;
-                std::vector<int32_t>& of = here ? m.off1 : m.off2;
-                std::vector<int32_t>& sr = here ? m.src1 : m.src2;
-                std::vector<float>& wv = here ? m.w1 : m.w2;
-                ex.push_back(e);
+                int own = -1;   // PLAY-4GPU: -1 this GPU; else the runner holding e, else its spread share
+                if (!(m.host_res && m.cache && m.host_res[(size_t) l * NE + e] >= 0) && m.n_off > 0) {
+                    for (int j = 0; j < m.n_off && own < 0; ++j)
+                        if (m.off_res[(size_t) j] && m.off_res[(size_t) j][(size_t) l * NE + e] >= 0) own = j;
+                    if (own < 0) own = (int) (((uint32_t) e * 2654435761u) >> 20) % m.n_off;
+                }
+                std::vector<int32_t>* ex = own < 0 ? &m.ex1 : &m.ex2[(size_t) own];
+                std::vector<int32_t>* of = own < 0 ? &m.off1 : &m.off2[(size_t) own];
+                std::vector<int32_t>* sr = own < 0 ? &m.src1 : &m.src2[(size_t) own];
+                std::vector<float>* wv = own < 0 ? &m.w1 : &m.w2[(size_t) own];
+                if (own >= 0) has_share[own] = true;
+                ex->push_back(e);
                 for (int32_t p = m.off[(size_t) e]; p < m.off[(size_t) e + 1]; ++p) {
                     const int32_t i = m.entry_of[(size_t) p];
-                    sr.push_back(i / (int32_t) K);
-                    wv.push_back(m.w_host[i]);
+                    sr->push_back(i / (int32_t) K);
+                    wv->push_back(m.w_host[i]);
                 }
-                of.push_back((int32_t) sr.size());
+                of->push_back((int32_t) sr->size());
             }
-            if (m.offload && !m.offload->run_layer(l, T, m.ex2, m.off2, m.src2, m.w2, SUB, nullptr, nullptr, err))
-                return false;
+            for (int j = 0; j < m.n_off; ++j)
+                if (has_share[j] &&
+                    !m.runners[(size_t) j]->run_layer(l, T, m.ex2[(size_t) j], m.off2[(size_t) j], m.src2[(size_t) j],
+                                                  m.w2[(size_t) j], SUB, nullptr, nullptr, err))
+                    return false;
             if (!m.local.run_layer(l, T, m.ex1, m.off1, m.src1, m.w1, SUB, b.mixed_h, b.bo_moe, err)) return false;
-            // ---- the MoE output (+ the second GPU's sums) goes into the residual stream as the next layer reads it
-            if (m.offload) {
+            // ---- the MoE output (+ the tiers' sums) goes into the residual stream as the next layer reads it
+            const size_t npieces = (size_t) ((T + SUB - 1) / SUB);
+            for (int j = 0; j < m.n_off; ++j) {
+                if (!has_share[j]) continue;
                 for (int64_t t0 = 0; t0 < T; t0 += SUB) {
-                    cudaStreamWaitEvent(m.xsum, m.offload->piece_done(t0 / SUB), 0);
+                    cudaStreamWaitEvent(m.xsum, m.runners[(size_t) j]->piece_done(t0 / SUB), 0);
                     const size_t bytes = (size_t) std::min(SUB, T - t0) * N * 2;
-                    cudaMemcpyAsync(b.sums + t0 * N, m.offload->host_sum() + t0 * N, bytes, cudaMemcpyHostToDevice,
-                                    m.xsum);
-                    cudaEventRecord(m.ev_piece[(size_t) (t0 / SUB)], m.xsum);
+                    cudaMemcpyAsync(b.sums[j] + t0 * N, m.runners[(size_t) j]->host_sum() + t0 * N, bytes,
+                                    cudaMemcpyHostToDevice, m.xsum);
+                    cudaEventRecord(m.ev_piece[(size_t) j * npieces + (size_t) (t0 / SUB)], m.xsum);
                 }
             }
+            for (int j = 0; j < m.n_off; ++j) pending_share[j] = has_share[j];
             pending = true;
         }
         mark(kPsCombine);   // the last layer's write

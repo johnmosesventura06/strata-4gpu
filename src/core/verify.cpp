@@ -160,9 +160,19 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
 
     const uint64_t T = (uint64_t) max_t, N = (uint64_t) g.n_embd, HC = (uint64_t) g.hc, K = (uint64_t) ss.k;
     head_rows_ = (head != nullptr && head->loaded()) ? head->rows() : n_vocab_;
-    if (head_rows_ != n_vocab_ && (shead_ == nullptr || shead_->split() != head_rows_)) {
-        err = "verify: the head holds part of the vocabulary without its other part";
-        return false;
+    if (head_rows_ != n_vocab_) {   // PLAY-4GPU: the parts must tile [head_rows_, n_vocab) without gaps
+        int64_t pos = head_rows_;
+        for (int i = 0; i < n_shead_; ++i) {
+            if (sheads_[i] == nullptr || sheads_[i]->split() != pos) {
+                err = "verify: the head holds part of the vocabulary without its other parts";
+                return false;
+            }
+            pos = sheads_[i]->end();
+        }
+        if (pos != n_vocab_) {
+            err = "verify: the head's parts do not cover the vocabulary";
+            return false;
+        }
     }
     const uint64_t C = (uint64_t) g.ssm_conv_channels, ZV = (uint64_t) g.ssm_value_dim, HV = (uint64_t) g.ssm_v_heads;
     const uint64_t NH = (uint64_t) g.n_head, HD = (uint64_t) g.head_dim, NKV = (uint64_t) g.n_head_kv;
@@ -196,7 +206,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
               mapped(64, (void**) &h_flagA_, (void**) &m_flagA_) &&
               mapped(64, (void**) &h_flagB_, (void**) &m_flagB_) &&
               mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_, portable) &&
-              mapped(128, (void**) &h_flag2_, (void**) &m_flag2_, portable) &&
+              mapped(512, (void**) &h_flag2_, (void**) &m_flag2_, portable) &&   // PLAY-4GPU: (grp, tier) 64B lines
               mapped((size_t) (2 * list2_stride_) * 4, (void**) &h_list2_, (void**) &m_list2_) &&
               mapped(T * (uint64_t) xk_stride_, (void**) &h_xk_, (void**) &m_xk_) &&
               mapped(T * (N / 32) * 36, (void**) &h_xq1_, (void**) &m_xq1_) &&
@@ -281,7 +291,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         sh_up_ = b.take<float>(T * (uint64_t) g.n_ff); sh_g_ = b.take<float>(T + 4);
         head_logits_ = b.take<float>(T * (uint64_t) n_vocab_);
         arg_scratch_ = b.take<uint8_t>(strata::kernels::argmax_rows_scratch_bytes((int) T));
-        if (shead_ != nullptr) head_full_ = b.take<float>(T * (uint64_t) n_vocab_);
+        if (n_shead_ > 0) head_full_ = b.take<float>(T * (uint64_t) n_vocab_);
         one_ = b.take<int32_t>(4);
         hist_snap_ = b.take<float>(T * HS);
         const uint64_t PD = (uint64_t) strata::kernels::NG_HC_DIM;
@@ -658,7 +668,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 auto norm_rope = [&](const float* in, int stride, float* out, const WeightRef* norm, int heads,
                                      int cols, cudaStream_t ns) {
                     native_qsa_norm_rope_tokens(in, stride, (const float*) norm->data, out, cols, n * heads, EPS,
-                                                (int) s.n_rot, (float) qsa_freq_base(), pos_ + tb * NH, heads, (int) NH,
+                                                (int) s.n_rot, rope_scaling(), pos_ + tb * NH, heads, (int) NH,
                                                 ns);
                 };
                 // three branches beside the values, joined before the attention: the indexer (its key and query
@@ -674,7 +684,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
                 native_qsa_indexer_append_multi(idx_raw + tb * ID, step_ + tb * kStepCount + kStepPos, (int) kStepCount, n,
                                                 0, (const float*) wikn->data, EPS, ib, s, st.max_cells,
-                                                (float) qsa_freq_base(), side_,
+                                                rope_scaling(), side_,
                                                 grp == 0 ? tail_snap_ + (size_t) qi * TS : nullptr);
                 norm_rope(qidx_ + tb * IQ * ID, (int) ID, qidx_ + tb * IQ * ID, wiqn, (int) IQ, (int) ID, side_);
                 qsa_block_scores(st.idx_pooled, st.idx_dead, qidx_ + tb * IQ * ID, step_ + tb * kStepCount, n, max_blocks_,
@@ -784,7 +794,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // FFN read: the shared expert, and the next layer's prediction
         if (gpu2_) {
             if (!fork(g2s_, g2fork_)) return false;
-            wait_flag_ge(m_flag2_ + (size_t) grp * 16, (uint32_t) (l * G + grp + 1), g2s_);
+            // PLAY-4GPU: wait every tier's flag for this group before taking the merged list in
+            for (int t = 0; t < ntiers_; ++t)
+                wait_flag_ge(m_flag2_ + (size_t) (grp * ntiers_ + t) * 16, (uint32_t) (l * G + grp + 1), g2s_);
             fetch_listed_rows(m_list2_ + grp * list2_stride_, m_ymiss_ + (size_t) tb * K * N,
                               hit_out_ + (size_t) tb * K * N, list2_ + grp * list2_stride_, (int) (n * K), N, g2s_);
             stamp(l, kLayerStamps + 1, g2s_);
@@ -969,9 +981,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         }
         if (head_ != nullptr && head_->loaded()) {
             try {
-                if (shead_ != nullptr) {   // the second GPU's part starts once the host sees the count
-                    copy_from_mapped(shead_->input(), head_mixed_, (int64_t) T * N, cs);
-                    mapped_bump(shead_->handoff(), cs);
+                for (int si = 0; si < n_shead_; ++si) {   // PLAY-4GPU: every head part sees the count and its input
+                    copy_from_mapped(sheads_[si]->input(), head_mixed_, (int64_t) T * N, cs);
+                    mapped_bump(sheads_[si]->handoff(), cs);
                 }
                 if (T >= 2) {
                     native_quantize_q8_1_il(head_mixed_, xq_, xil_, (int) N, T, cs);
@@ -1072,7 +1084,7 @@ bool Verifier::capture_commit(std::string& err) {
                 const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
                 native_qsa_indexer_append_multi(idx_raw_L_ + (size_t) (qsa_index * MT) * ID, commit_ + 2, 1, (int) MT, 0,
                                                 (const float*) wikn->data, EPS, ib, s, st.max_cells,
-                                                (float) qsa_freq_base(), cs_);
+                                                rope_scaling(), cs_);
                 ++qsa_index;
             }
         }
@@ -1131,8 +1143,8 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     *(volatile uint32_t*) h_flagB_ = 0;
     *(volatile uint32_t*) h_pseq_ = 0;
     *(volatile uint32_t*) h_pleflag_ = 0;
-    h_flag2_[0] = h_flag2_[16] = 0;
-    sink_.gpu2_ring = 0;
+    std::memset(h_flag2_, 0, 8 * 16 * sizeof(uint32_t));   // every (grp, tier) line, PLAY-4GPU
+    for (int t = 0; t < GpuPlanSink::kMaxTiers; ++t) sink_.tier_ring[t] = 0;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     last_t_ = T;
     last_pos0_ = pos0;
@@ -1150,8 +1162,10 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     auto release = [&] {
         h_list2_[0] = h_list2_[list2_stride_] = 0;
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        for (uint32_t* f : {h_flag_, h_flagA_, h_flagB_, h_pleflag_, h_flag2_, h_flag2_ + 16})
+        for (uint32_t* f : {h_flag_, h_flagA_, h_flagB_, h_pleflag_})
             *(volatile uint32_t*) f = 0xffffffffu;
+        for (int i = 0; i < 8; ++i)   // every (grp, tier) line, PLAY-4GPU
+            *(volatile uint32_t*) (h_flag2_ + (size_t) i * 16) = 0xffffffffu;
         cudaStreamSynchronize(cs_);
         return false;
     };
@@ -1229,20 +1243,30 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             *(volatile uint32_t*) h_flagA_ = want;
             raise_flag(h_flagB_, want);
         }
-        if (gpu2_ && sink_.gpu2_ring != want) {   // no second-GPU share went out (the pool failed): an empty one
-            sink_.gpu2_list[0] = 0;
-            std::atomic_thread_fence(std::memory_order_seq_cst);
-            *(volatile uint32_t*) sink_.gpu2_flag = want;
+        if (gpu2_) {   // no share went out to a tier (the pool failed): an empty one, and the merged list is dropped
+            bool any_fallback = false;
+            for (int t = 0; t < ntiers_; ++t)
+                if (sink_.tier_ring[t] != want) {
+                    any_fallback = true;
+                    std::atomic_thread_fence(std::memory_order_seq_cst);
+                    *(volatile uint32_t*) sink_.tier_flag[t] = want;
+                }
+            if (any_fallback && sink_.tier_list[0] != nullptr) sink_.tier_list[0][0] = 0;
         }
         *flag = want;
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
         ms_pool += ms_since(b);
-        if (gpu2_ && *(volatile uint32_t*) sink_.gpu2_flag < want) {
-            settle(true);   // a split window's other token group
-            late_flag = sink_.gpu2_flag;
-            late_want = want;
-            late_at = Clock::now();
-            ++late2;
+        if (gpu2_) {   // PLAY-4GPU: a tier's rows landed after the CPU's — count it once, watch its last line
+            bool any_late = false;
+            for (int t = 0; t < ntiers_; ++t)
+                if (*(volatile uint32_t*) sink_.tier_flag[t] < want) any_late = true;
+            if (any_late) {
+                settle(true);   // a split window's other token group
+                late_flag = sink_.tier_flag[ntiers_ - 1];
+                late_want = want;
+                late_at = Clock::now();
+                ++late2;
+            }
         }
         if (tail_ != nullptr && k + 1 == g.n_layers * G) tail_(tail_user_);
         // the next layer's prediction, published during this layer's pool, else microseconds later (its branch is
@@ -1272,37 +1296,54 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     }
     settle(true);
     const bool sampled = head_sampling_ && ((!sampling_.greedy && sampling_.temperature > 0.0f) || hist_d_ != nullptr);
-    const bool whole = shead_ != nullptr && (logits_wanted_ || sampled);
-    if (shead_ != nullptr) {   // the head's input is handed over after the last layer: the second GPU's part then
+    const bool whole = n_shead_ > 0 && (logits_wanted_ || sampled);
+    if (n_shead_ > 0) {   // the head's input is handed over after the last layer: each part then computes its rows
         ++hand_n_;
-        const Clock::time_point h0 = Clock::now();
-        while (*(volatile uint32_t*) shead_->handoff() < hand_n_) {
-            _mm_pause();
-            if (ms_since(h0) > 5000.0) {
-                err = std::string("verify: the head's input never came (") + cudaGetErrorString(cudaStreamQuery(cs_)) +
-                      ")";
-                return false;
+        for (int si = 0; si < n_shead_; ++si) {
+            const Clock::time_point h0 = Clock::now();
+            while (*(volatile uint32_t*) sheads_[si]->handoff() < hand_n_) {
+                _mm_pause();
+                if (ms_since(h0) > 5000.0) {
+                    err = std::string("verify: the head's input never came (") +
+                          cudaGetErrorString(cudaStreamQuery(cs_)) + ")";
+                    return false;
+                }
             }
+            if (!sheads_[si]->submit(T, whole, err)) return false;
         }
-        if (!shead_->submit(T, whole, err)) return false;
         ++done_n_;
     }
     const cudaError_t se = cudaStreamSynchronize(cs_);
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
     cudaStreamSynchronize(copy_);   // no host function of this window may raise flag B in the next one
-    if (shead_ != nullptr) {   // each token's larger logit; on equality this GPU's, the lower index
-        if (!shead_->wait(done_n_, err)) return false;
+    if (n_shead_ > 0) {   // PLAY-4GPU: each token's larger logit over main and every part; on equality, lowest id
+        for (int si = 0; si < n_shead_; ++si)
+            if (!sheads_[si]->wait(done_n_, err)) return false;
         for (int t = 0; t < T; ++t) {
-            const float v1 = ((volatile float*) h_val_)[t], v2 = ((volatile const float*) shead_->val())[t];
-            if (v2 > v1) ((volatile int32_t*) h_out_)[t] = (int32_t) (shead_->split() + shead_->idx()[t]);
+            float best = ((volatile float*) h_val_)[t];
+            int32_t pick = ((volatile int32_t*) h_out_)[t];
+            for (int si = 0; si < n_shead_; ++si) {
+                const float v2 = ((volatile const float*) sheads_[si]->val())[t];
+                if (v2 > best) {
+                    best = v2;
+                    pick = (int32_t) (sheads_[si]->split() + sheads_[si]->idx()[t]);
+                }
+            }
+            ((volatile int32_t*) h_out_)[t] = pick;
+            ((volatile float*) h_val_)[t] = best;
         }
-        if (whole) join_rows(head_full_, n_vocab_, head_logits_, head_rows_, shead_->logits(), T, cs_);
+        if (whole) {
+            strata::kernels::join_range(head_full_, n_vocab_, head_logits_, 0, head_rows_, head_rows_, T, cs_);
+            for (int si = 0; si < n_shead_; ++si)
+                strata::kernels::join_range(head_full_, n_vocab_, sheads_[si]->logits(), sheads_[si]->split(),
+                                           sheads_[si]->end(), sheads_[si]->part_rows(), T, cs_);
+        }
     }
     // a sampled or penalized request: the head's sampling again, after the graph (see set_sampling)
     if (sampled) {
         SamplerParams sp = sampling_;
         sp.counter = (uint64_t) pos0;
-        sample_tokens(shead_ != nullptr ? head_full_ : head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_,
+        sample_tokens(n_shead_ > 0 ? head_full_ : head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_,
                       cs_);
         if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = "verify: the head sampling failed"; return false; }
     }
@@ -1343,8 +1384,8 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
 }
 
 bool Verifier::copy_logits(int T, float* out, std::string& err) const {
-    if (shead_ != nullptr && !logits_wanted_) { err = "verify: the logits need set_logits_wanted"; return false; }
-    const float* src = shead_ != nullptr ? head_full_ : head_logits_;
+    if (n_shead_ > 0 && !logits_wanted_) { err = "verify: the logits need set_logits_wanted"; return false; }
+    const float* src = n_shead_ > 0 ? head_full_ : head_logits_;
     if (cudaMemcpyAsync(out, src, (size_t) T * (size_t) n_vocab_ * sizeof(float), cudaMemcpyDeviceToHost,
                         cs_) != cudaSuccess ||
         cudaStreamSynchronize(cs_) != cudaSuccess) {
@@ -1407,8 +1448,11 @@ void Verifier::set_plan_slot(int grp) {
     sink_.staging = (unsigned long long) (staging_ + (size_t) (grp * per) * strata::kernels::cpu::expert_layout().max_blob);
     sink_.staging_cap = per;
     if (gpu2_) {
-        sink_.gpu2_list = h_list2_ + (size_t) grp * (size_t) list2_stride_;
-        sink_.gpu2_flag = h_flag2_ + (size_t) grp * 16;
+        sink_.tier_list[0] = h_list2_ + (size_t) grp * (size_t) list2_stride_;   // ONE merged list per group
+        sink_.tier_list[1] = sink_.tier_list[2] = sink_.tier_list[3] = nullptr;
+        for (int t = 0; t < ntiers_; ++t)
+            sink_.tier_flag[t] = h_flag2_ + (size_t) (grp * ntiers_ + t) * 16;
+        for (int t = ntiers_; t < GpuPlanSink::kMaxTiers; ++t) sink_.tier_flag[t] = nullptr;
         sink_.ring = cur_layer_ + 1;
     }
 }

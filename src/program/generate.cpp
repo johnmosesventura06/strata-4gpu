@@ -18,6 +18,10 @@
 #include "strata/core/adaptive_tier.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/second_gpu.hpp"
+#include "strata/kernels/rope_scaling.hpp"
+
+#include <fcntl.h>
+#include <unistd.h>
 #include "strata/core/split_head.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/layer.hpp"
@@ -111,7 +115,18 @@ struct Options {
     bool native_flash_attn_short = false; // diagnostic pinned attention, context <=256
     bool native_qsa_indexer = false;  // pinned F16 key cache and F32 pooling
     bool native_qsa = false;          // pinned F32 QSA norms and gate
-    bool native_rope = false;         // pinned text-only CUDA rotary arithmetic
+    bool native_rope = false;
+    /// rope scaling past the trained 262K (ported from upstream main, trimmed to the CLI: the artifacts ship
+    /// no rope.scaling keys). Process constant, resolved once before session_init and any graph capture.
+    std::string rope_scaling;                    ///< --rope-scaling none|linear|yarn
+    double rope_scale = 0;                       ///< --rope-scale F (0 = absent; must be >= 1 when given)
+    double rope_freq_base = 0;                   ///< --rope-freq-base N (0 = 1e7)
+    double rope_freq_scale = 0;                  ///< --rope-freq-scale F (0 = 1/factor)
+    double yarn_orig_ctx = 0;                    ///< --yarn-orig-ctx N (0 = 262144)
+    double yarn_ext_factor = -1.0;               ///< --yarn-ext-factor F (<0 = auto: 1 for yarn, else 0)
+    double yarn_attn_factor = 1.0;               ///< --yarn-attn-factor F
+    double yarn_beta_fast = 32.0;                ///< --yarn-beta-fast F
+    double yarn_beta_slow = 1.0;                 ///< --yarn-beta-slow F         // pinned text-only CUDA rotary arithmetic
     bool native_ple_postops = false;  // pinned PLE postprojection arithmetic
     bool native_router = false;       // pinned fused 512-expert top-10 router
     bool cpu_oracle_q8_0 = false;      // pinned x86 activation scales/codes at both expert stages
@@ -238,6 +253,7 @@ struct Options {
     /// A second GPU (device ordinal) as another expert tier, with this much VRAM for experts (0 = all but
     /// `second_gpu_reserve_mib`).
     int second_gpu = -1;
+    std::vector<int> tier_gpus;   ///< PLAY-4GPU: tier devices in order (--tier-gpus; --second-gpu appends)
     double second_gpu_gib = 0.0;
     int second_gpu_reserve_mib = 2048;
     double second_gpu_min_mb = 4.0;   ///< a layer's misses from which it takes its share (smaller: the CPU is quicker)
@@ -320,6 +336,13 @@ void usage() {
                  "  --native-qsa-indexer  experimental pinned indexer key cache and pooling\n"
                  "  --native-qsa          experimental pinned QSA normalization and output gate\n"
                  "  --native-rope         experimental pinned text-only CUDA rotary arithmetic\n"
+                 "  --rope-scaling T     extend the context past the trained one: none, linear (position\n"
+                 "                       interpolation) or yarn. Fixed at startup: K in the cache is post-RoPE,\n"
+                 "                       so one run uses one scaling.\n"
+                 "  --rope-scale F       the extension factor (>= 1), e.g. 2 for 524288 over a 262144 training run\n"
+                 "  --rope-freq-base N   the rotation base (0 = 1e7)   --rope-freq-scale F  the raw shrink (0 = 1/F)\n"
+                 "  --yarn-orig-ctx N    trained context (0 = 262144)  --yarn-ext-factor F  <0 = auto (1 for yarn)\n"
+                 "  --yarn-attn-factor F --yarn-beta-fast F --yarn-beta-slow F  the remaining YaRN knobs\n"
                  "  --native-ple-postops  experimental pinned PLE postprojection arithmetic\n"
                  "  --native-router       experimental pinned CUDA 512-expert top-10 routing\n"
                  "  --cpu-oracle-q8-0     experimental pinned CPU expert quantization and dot reduction\n"
@@ -495,6 +518,7 @@ struct Drive {
     /// end before the next window's first pool (`gap_ms`, a running average of that gap, at the tier's measured copy
     /// rate), the rest at the last tail before the next update.
     strata::core::AdaptiveTier* tier2 = nullptr;
+    std::vector<strata::core::AdaptiveTier*> tier2s;   // PLAY-4GPU: every live tier's adaptive tier
     double gap_ms = 0;
     Clock::time_point tail_at{}, copies_end{};   // the last window's CPU rows done; the gap's queued copies end
     bool gap_open = false;                       // no pool since the tail
@@ -571,7 +595,7 @@ void drive_window(Drive* t, int T) {
         const std::string moved = t->placement->tick(*t->d.pool);
         if (!moved.empty()) std::fprintf(stderr, "strata generate: %s\n", moved.c_str());
     }
-    if (t->tier2 != nullptr) t->tier2->apply_pending(false);
+    for (auto* t2 : t->tier2s) t2->apply_pending(false);   // PLAY-4GPU: every tier admits its landed moves
     if (t->tier1 == nullptr) return;
     t->tier1->apply_pending(false);
     if (t->burst) {   // all of them, at once
@@ -616,10 +640,12 @@ bool pump_gap(Drive* t, std::string& err, bool all = false) {
     return true;
 }
 
-/// Whether the second GPU's work so far succeeded (Verifier::set_watch).
+/// Whether the tier GPUs' work so far succeeded (Verifier::set_watch).  PLAY-4GPU: every wired tier answers.
 bool drive_watch(void* user, std::string& err) {
     Drive* t = (Drive*) user;
-    return t->d.gpu2 == nullptr || t->d.gpu2->healthy(err);
+    for (int i = 0; i < t->d.n_tier; ++i)
+        if (t->d.tier[i] != nullptr && !t->d.tier[i]->healthy(err)) return false;
+    return true;
 }
 
 /// A window's last CPU rows are in (Verifier::set_tail).
@@ -740,41 +766,51 @@ struct SlotLoan {
 /// chunk needs, else allocated once for the longest chunk.
 struct PromptBuffers {
     strata::prefill::Prefill* prefill = nullptr;
-    strata::prefill::ExpertRunner* offload = nullptr;   // the second GPU's share, or null
+    std::vector<strata::prefill::ExpertRunner*> off;   // PLAY-4GPU: one runner per tier GPU, may be empty
+    const int32_t* skip_any = nullptr;                 // experts held anywhere: the runners' prefetch-area skip
     const strata::core::ModelGeometry* g = nullptr;
     const strata::core::SessionState* ss = nullptr;
-    SlotLoan loan, loan2;   // each GPU's cache (a null cache lends nothing)
-    bool lend = false, lend2 = false;
+    SlotLoan loan; std::vector<SlotLoan> loan2;   // each GPU's cache (a null cache lends nothing)
+    bool lend = false; std::vector<bool> lend2;
 
-    /// After the prompt path and its second GPU's runner have been initialized.
+    /// After the prompt path and its tier runners have been initialized.  PLAY-4GPU: every runner lends from, and
+    /// allocates in, its OWN card's cache; only the sums staging is on this card, so bytes_needed counts them.
     bool init(int64_t max_chunk, bool borrow, std::string& err) {
         lend = borrow && loan.cache != nullptr && loan.res != nullptr && !loan.res->empty() &&
-               loan.plan(strata::prefill::Prefill::bytes_needed(*g, *ss, max_chunk, offload != nullptr));
-        lend2 = offload != nullptr && borrow && loan2.cache != nullptr && loan2.res != nullptr && !loan2.res->empty() &&
-                loan2.plan(strata::prefill::ExpertRunner::bytes_needed(max_chunk, g->n_expert, true, true));
-        return (lend || prefill->bind(nullptr, 0, max_chunk, err)) &&
-               (offload == nullptr || lend2 || offload->bind(nullptr, 0, max_chunk, err));
+               loan.plan(strata::prefill::Prefill::bytes_needed(*g, *ss, max_chunk, (int) off.size()));
+        lend2.assign(off.size(), false);
+        for (size_t j = 0; j < off.size(); ++j)
+            lend2[j] = borrow && loan2[j].cache != nullptr && loan2[j].res != nullptr && !loan2[j].res->empty() &&
+                       loan2[j].plan(strata::prefill::ExpertRunner::bytes_needed(max_chunk, g->n_expert, true, true));
+        if (!(lend || prefill->bind(nullptr, 0, max_chunk, err))) return false;
+        for (size_t j = 0; j < off.size(); ++j)
+            if (!lend2[j] && !off[j]->bind(nullptr, 0, max_chunk, err)) return false;
+        return true;
     }
     /// Before a prompt whose chunks hold up to `chunk` tokens.
     bool take(int64_t chunk, std::string& err) {
-        // sized before either loan, from the residency both GPUs' prefetch areas are sized for
+        // sized before either loan, from the residency the prefetch areas are sized for
         const uint64_t need = lend ? prefill->bytes_for(chunk) : 0;
-        const uint64_t need2 = lend2 ? offload->bytes_for(chunk, loan.res ? loan.res->data() : nullptr) : 0;
         if (lend) {
             loan.plan(need);
             loan.lend();
             if (!prefill->bind(loan.base(), loan.bytes(), chunk, err)) return false;
         }
-        if (lend2) {
-            loan2.plan(need2);
-            loan2.lend();
-            if (!offload->bind(loan2.base(), loan2.bytes(), chunk, err)) return false;
+        for (size_t j = 0; j < off.size(); ++j) {   // PLAY-4GPU: each runner's area is sized against held-anywhere
+            if (!lend2[j]) continue;
+            const uint64_t need2 = off[j]->bytes_for(chunk, skip_any);
+            loan2[j].plan(need2);
+            loan2[j].lend();
+            if (!off[j]->bind(loan2[j].base(), loan2[j].bytes(), chunk, err)) return false;
         }
         return true;
     }
     /// After it: the lent slots refilled.
     bool give_back(strata::core::ExpertSource& src, std::string& err) {
-        return loan.give_back(src, g->n_expert, err) && loan2.give_back(src, g->n_expert, err);
+        if (!loan.give_back(src, g->n_expert, err)) return false;
+        for (auto& l2 : loan2)
+            if (!l2.give_back(src, g->n_expert, err)) return false;
+        return true;
     }
 };
 
@@ -863,6 +899,15 @@ int main(int argc, char** argv) {
         else if (a == "--native-qsa-indexer") o.native_qsa_indexer = true;
         else if (a == "--native-qsa") o.native_qsa = true;
         else if (a == "--native-rope") o.native_rope = true;
+        else if (a == "--rope-scaling") o.rope_scaling = next("--rope-scaling");
+        else if (a == "--rope-scale") o.rope_scale = std::atof(next("--rope-scale"));
+        else if (a == "--rope-freq-base") o.rope_freq_base = std::atof(next("--rope-freq-base"));
+        else if (a == "--rope-freq-scale") o.rope_freq_scale = std::atof(next("--rope-freq-scale"));
+        else if (a == "--yarn-orig-ctx") o.yarn_orig_ctx = std::atof(next("--yarn-orig-ctx"));
+        else if (a == "--yarn-ext-factor") o.yarn_ext_factor = std::atof(next("--yarn-ext-factor"));
+        else if (a == "--yarn-attn-factor") o.yarn_attn_factor = std::atof(next("--yarn-attn-factor"));
+        else if (a == "--yarn-beta-fast") o.yarn_beta_fast = std::atof(next("--yarn-beta-fast"));
+        else if (a == "--yarn-beta-slow") o.yarn_beta_slow = std::atof(next("--yarn-beta-slow"));
         else if (a == "--native-ple-postops") o.native_ple_postops = true;
         else if (a == "--native-router") o.native_router = true;
         else if (a == "--cpu-oracle-q8-0") o.cpu_oracle_q8_0 = true;
@@ -900,6 +945,16 @@ int main(int argc, char** argv) {
         else if (a == "--mtp-window") o.mtp_window = std::atoll(next("--mtp-window"));
         else if (a == "--main-gpu") o.main_gpu = std::atoi(next("--main-gpu"));
         else if (a == "--second-gpu") o.second_gpu = std::atoi(next("--second-gpu"));
+        else if (a == "--tier-gpus") {   // PLAY-4GPU: "1,2,3" — tier devices, first ones get the ranked profile
+            std::string v = next("--tier-gpus");
+            size_t c = 0;
+            do {
+                const std::string part = v.substr(c, v.find(',', c) - c);
+                if (!part.empty()) o.tier_gpus.push_back(std::atoi(part.c_str()));
+                const size_t e = v.find(',', c);
+                c = e == std::string::npos ? e : e + 1;
+            } while (c != std::string::npos && c < v.size() + 1 && c > 0);
+        }
         else if (a == "--second-gpu-gib") o.second_gpu_gib = std::atof(next("--second-gpu-gib"));
         else if (a == "--second-gpu-reserve-mib") o.second_gpu_reserve_mib = std::atoi(next("--second-gpu-reserve-mib"));
         else if (a == "--second-gpu-min-mb") o.second_gpu_min_mb = std::atof(next("--second-gpu-min-mb"));
@@ -982,9 +1037,21 @@ int main(int argc, char** argv) {
                      n_dev);
         return 2;
     }
-    if (o.second_gpu >= 0 && (o.second_gpu == o.main_gpu || o.second_gpu >= n_dev)) {
-        std::fprintf(stderr, "strata generate: --second-gpu %d is not another visible CUDA device\n", o.second_gpu);
-        return 2;
+    if (o.tier_gpus.empty() && o.second_gpu >= 0) o.tier_gpus.push_back(o.second_gpu);   // PLAY-4GPU compat
+    if (o.second_gpu < 0 && !o.tier_gpus.empty()) o.second_gpu = o.tier_gpus[0];          // head split / placement
+    {
+        std::vector<int> keep;
+        for (size_t i = 0; i < o.tier_gpus.size(); ++i) {
+            const int dv = o.tier_gpus[i];
+            bool dup = false;
+            for (size_t j = 0; j < i; ++j) dup = dup || o.tier_gpus[j] == dv;
+            if (dv < 0 || dv >= n_dev || dv == o.main_gpu || dup) {
+                std::fprintf(stderr, "strata generate: --tier-gpus entry %d is not a distinct visible CUDA device\n", dv);
+                return 2;
+            }
+            keep.push_back(dv);
+        }
+        o.tier_gpus = keep;
     }
     strata::core::qsa_set_kv_format(o.kv == "int8"   ? strata::core::KvFormat::Int8
                                     : o.kv == "k8v4" ? strata::core::KvFormat::K8V4
@@ -1227,6 +1294,64 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: session state allocation failed\n");
         return 1;
     }
+    // ---- rope scaling resolution (upstream main's block, trimmed to the CLI: no gguf rope keys exist in
+    // these artifacts). Validate as a whole, then set the process constants: session_init builds the rope
+    // tables from them, and captured graphs bake the analytic kernels' arguments.
+    strata::kernels::RopeScaling rope_cfg;
+    {
+        using RST = strata::kernels::RopeScalingType;
+        if (o.rope_scaling == "none") rope_cfg.type = RST::None;
+        else if (o.rope_scaling == "linear") rope_cfg.type = RST::Linear;
+        else if (o.rope_scaling == "yarn") rope_cfg.type = RST::YaRN;
+        else if (!o.rope_scaling.empty()) {
+            std::fprintf(stderr, "strata generate: --rope-scaling must be none, linear or yarn (got '%s')\n",
+                         o.rope_scaling.c_str());
+            return 2;
+        }
+        for (const double v : {o.rope_scale, o.rope_freq_base, o.rope_freq_scale, o.yarn_orig_ctx,
+                               o.yarn_ext_factor, o.yarn_attn_factor, o.yarn_beta_fast, o.yarn_beta_slow})
+            if (!std::isfinite(v)) {
+                std::fprintf(stderr, "strata generate: a rope scaling knob is not a finite number (%g)\n", v);
+                return 2;
+            }
+        if (o.rope_scale != 0 && o.rope_scale < 1.0) {
+            std::fprintf(stderr, "strata generate: --rope-scale %g must be >= 1 (it extends the context)\n",
+                         o.rope_scale);
+            return 2;
+        }
+        if (o.rope_freq_base != 0 && o.rope_freq_base <= 1.0) {
+            std::fprintf(stderr, "strata generate: --rope-freq-base must be a base above 1 (0 = 1e7)\n");
+            return 2;
+        }
+        if (o.rope_freq_scale < 0 || o.yarn_orig_ctx < 0 || o.yarn_ext_factor < -1.0 || o.yarn_attn_factor <= 0 ||
+            o.yarn_beta_fast <= 0 || o.yarn_beta_slow <= 0) {
+            std::fprintf(stderr, "strata generate: invalid rope scaling knob (see usage)\n");
+            return 2;
+        }
+        if (o.rope_scale > 0) rope_cfg.factor = o.rope_scale;
+        if (o.rope_freq_base > 0) rope_cfg.freq_base = o.rope_freq_base;
+        if (o.yarn_orig_ctx > 0) rope_cfg.orig_ctx = o.yarn_orig_ctx;
+        rope_cfg.freq_scale_in = o.rope_freq_scale;
+        rope_cfg.ext_factor = o.yarn_ext_factor >= 0 ? o.yarn_ext_factor
+                                                     : (rope_cfg.type == RST::YaRN ? 1.0 : 0.0);
+        rope_cfg.attn_factor = o.yarn_attn_factor;
+        rope_cfg.beta_fast = o.yarn_beta_fast;
+        rope_cfg.beta_slow = o.yarn_beta_slow;
+        if (const char* why = strata::kernels::rope_scaling_invalid(rope_cfg)) {
+            std::fprintf(stderr, "strata generate: invalid rope scaling configuration: %s (factor %g, base %g, "
+                                 "original context %g)\n", why, rope_cfg.factor, rope_cfg.freq_base, rope_cfg.orig_ctx);
+            return 2;
+        }
+        if ((rope_cfg.type != RST::None || o.rope_scaling == "none") && o.max_context > rope_cfg.orig_ctx) {
+            const char* tn = rope_cfg.type == RST::YaRN ? "yarn" : rope_cfg.type == RST::Linear ? "linear" : "none";
+            std::fprintf(stderr, "strata generate: rope scaling %s, factor %.6g (freq_scale %.6g, mscale %.6f), "
+                                 "--max-context %lld against a trained context of %.0f\n", tn, rope_cfg.factor,
+                         rope_cfg.freq_scale(), rope_cfg.mscale(), (long long) o.max_context, rope_cfg.orig_ctx);
+        }
+        if (rope_cfg.type == RST::None && (o.rope_scale > 1.0 || o.rope_freq_scale > 0 || o.yarn_ext_factor > 0))
+            std::fprintf(stderr, "strata generate: note: --rope-scaling none, so the scaling knobs have no effect\n");
+        strata::kernels::rope_scaling_set(rope_cfg);
+    }
     strata::core::SessionState ss;
     // **THE ENGINE RAN ON THE LEGACY DEFAULT STREAM, WHICH ON WDDM IS THE SLOW PATH.**  All four session
     // calls - `session_capture`, `session_replay`, `session_token` and `session_loop` - were handed `nullptr`,
@@ -1444,7 +1569,7 @@ int main(int argc, char** argv) {
     if (wo == nullptr) { std::fprintf(stderr, "strata generate: output.weight is missing\n"); return 1; }
     const int64_t n_vocab = wo->ne1;
     strata::core::NativeHead native_head;
-    std::unique_ptr<strata::core::SplitHead> split_head;
+    std::vector<std::unique_ptr<strata::core::SplitHead>> split_heads;   // PLAY-4GPU: one part per tier GPU
     if (!o.native_head_gguf.empty()) {
         std::vector<std::string> head_shards;
         try {
@@ -1459,26 +1584,33 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stderr, "strata generate: native head, type %d, %llu bytes\n", native_head.type(),
                      (unsigned long long) native_head.weight_bytes());
-        // the head's last rows on the second GPU (split_head.hpp): each GPU streams its part after the last layer.
-        // The drafter gathers its draft head's rows first; without one it needs the whole head here.
-        if (o.second_gpu >= 0 && o.head_split > 0.0 && o.head_split < 1.0 && o.spec >= 2) {
-            const int64_t split = (int64_t) ((1.0 - o.head_split) * (double) n_vocab) / 256 * 256;
-            auto sh = std::make_unique<strata::core::SplitHead>();
+        // the head's last rows split across the tier GPUs (split_head.hpp): each streams its part after the last
+        // layer, so no one card carries the head's streaming while the window waits on its flag. The drafter
+        // gathers its draft head's rows first; without one it needs the whole head here (PLAY-4GPU).
+        const int sh_parts = (int) std::min<size_t>(o.tier_gpus.size(), 3);
+        if (sh_parts > 0 && o.head_split > 0.0 && o.head_split < 1.0 && o.spec >= 2) {
+            const int64_t split0 = (int64_t) ((1.0 - o.head_split) * (double) n_vocab) / 256 * 256;
+            const int64_t sharded = n_vocab - split0;
+            const int64_t per = sharded / sh_parts / 256 * 256;
             std::string e2;
-            const bool ok = (o.mtp.empty() || mtp.bind_head(&native_head, e2)) &&
-                            (o.mtp.empty() || mtp.has_draft_head()) &&
-                            sh->init(o.second_gpu, o.main_gpu, head_shards, g.n_embd, n_vocab, split, o.max_window(),
-                                     e2) &&
-                            native_head.keep_rows(split, e2);
-            if (ok) {
-                std::fprintf(stderr, "strata generate: the head's rows %lld-%lld on the second GPU (%.0f MiB), the "
-                                     "first %lld here\n", (long long) split, (long long) n_vocab,
-                             (double) sh->bytes() / 1048576.0, (long long) split);
-                split_head = std::move(sh);
-            } else {
-                std::fprintf(stderr, "strata generate: the head stays on the main GPU: %s\n",
-                             e2.empty() ? "the draft layer has no draft head of its own" : e2.c_str());
+            bool ok = per > 0 && (o.mtp.empty() || (mtp.bind_head(&native_head, e2) && mtp.has_draft_head()));
+            std::vector<std::unique_ptr<strata::core::SplitHead>> built;
+            for (int i = 0; ok && i < sh_parts; ++i) {
+                const int64_t lo = split0 + per * i;
+                const int64_t hi = (i + 1 == sh_parts) ? n_vocab : split0 + per * (i + 1);
+                auto sh = std::make_unique<strata::core::SplitHead>();
+                ok = sh->init(o.tier_gpus[i], o.main_gpu, head_shards, g.n_embd, n_vocab, lo, o.max_window(), e2, hi);
+                if (ok) {
+                    std::fprintf(stderr, "strata generate: the head's rows %lld-%lld on GPU %d (%.0f MiB)\n",
+                                 (long long) lo, (long long) hi, o.tier_gpus[i],
+                                 (double) sh->bytes() / 1048576.0);
+                    built.push_back(std::move(sh));
+                }
             }
+            if (ok) ok = native_head.keep_rows(split0, e2);
+            if (ok) split_heads = std::move(built);
+            else std::fprintf(stderr, "strata generate: the head stays on the main GPU: %s\n",
+                              e2.empty() ? "the draft layer has no draft head of its own" : e2.c_str());
         }
     }
     // ---- R4's slot storage.  Allocated AFTER the weights, the session and the head, so `cudaMemGetInfo` inside
@@ -1510,7 +1642,7 @@ int main(int argc, char** argv) {
         const bool borrow = !o.no_prefill_borrow && !o.expert_profile.empty();
         const int64_t prefill_mib = (o.prefill_chunk > 0 && !borrow)
             ? (int64_t) (strata::prefill::Prefill::bytes_needed(g, ss, o.prefill_chunk,
-                                                                o.second_gpu >= 0 && !o.no_prompt_offload) >> 20)
+                                                                o.no_prompt_offload ? 0 : (int) std::min<size_t>(o.tier_gpus.size(), 3)) >> 20)
             : 0;
         const int64_t reserve = ((int64_t) o.vram_reserve_mib + prefill_mib) << 20;
         int64_t slots = ((int64_t) free_b - reserve) / (int64_t) strata::kernels::cpu::expert_layout().max_blob;
@@ -2258,128 +2390,157 @@ int main(int argc, char** argv) {
     // ---- a second GPU as another expert tier: the profile's pairs the first GPU's cache does not hold, then empty
     // slots for every layer, which its own adaptive tier fills with the conversation's experts the first tier has not.
     // Without free VRAM there (another process holds it) the engine runs on the main GPU alone.
-    strata::core::SecondGpu gpu2;
-    std::vector<int32_t> host_res2;
-    strata::core::AdaptiveTier tier2;
-    if (o.second_gpu >= 0) {
+    // ---- tier GPUs as computing expert tiers (PLAY-4GPU): per device, the profile's pairs the earlier tiers do
+    // not hold, then empty slots for every layer, which that tier's own adaptive tier fills with the conversation's
+    // experts the upper tiers have not. A tier without free VRAM (another process holds it) is skipped; the engine
+    // runs on the tiers that came up.
+    std::vector<std::unique_ptr<strata::core::SecondGpu>> gpus2;
+    std::vector<std::unique_ptr<std::vector<int32_t>>> res2s;   // heap-stable: AdaptiveTier stores &res
+    std::vector<std::unique_ptr<strata::core::AdaptiveTier>> tiers2;
+    std::vector<int> live_devs;
+    if (!o.tier_gpus.empty()) {
         if (!native_pack || host_res.empty() || o.spec < 2) {
-            std::fprintf(stderr, "strata generate: --second-gpu needs a native pack, --expert-profile and --spec\n");
+            std::fprintf(stderr, "strata generate: --tier-gpus/--second-gpu needs a native pack, --expert-profile and --spec\n");
             return 2;
         }
         const int main_dev = o.main_gpu;
-        cudaDeviceProp prop{};
-        cudaGetDeviceProperties(&prop, o.second_gpu);
-        // prefetch slots for the most of the smallest experts the budget holds
         const auto& lay0 = strata::kernels::cpu::expert_layout();
         uint64_t min_blob = lay0.max_blob;
         for (int64_t l = 0; l < g.n_layers; ++l) min_blob = std::min<uint64_t>(min_blob, lay0.blob_bytes(l));
         const uint64_t pf_bytes = (uint64_t) (std::max(0.0, o.second_gpu_prefetch_mb) * 1048576.0);
         drive.d.gpu2_prefetch_bytes = pf_bytes;
-        bool ok = gpu2.init(o.second_gpu, main_dev, g.n_embd, g.n_ff, o.max_window(), ss.k, err) &&
-                  gpu2.init_prefetch((int) std::min<uint64_t>(pf_bytes / min_blob, 64), lay0.max_blob, err);
         const auto& lay = strata::kernels::cpu::expert_layout();
-        std::vector<int64_t> sizes;
-        std::vector<std::pair<int32_t, int32_t>> pre;
-        std::vector<int32_t> empty2;
-        if (ok) {
-            cudaSetDevice(o.second_gpu);
-            size_t free_b = 0, total_b = 0;
-            cudaMemGetInfo(&free_b, &total_b);
-            // the prompt path's buffers there borrow cache slots, else they are reserved here
-            const bool offload_own = o.prefill_chunk > 0 && !o.no_prompt_offload && o.no_prefill_borrow;
-            const uint64_t reserve = ((uint64_t) o.second_gpu_reserve_mib << 20) +
-                (offload_own ? strata::prefill::ExpertRunner::bytes_needed(o.prefill_chunk, g.n_expert, true, true) : 0);
-            const uint64_t budget = o.second_gpu_gib > 0 ? (uint64_t) (o.second_gpu_gib * 1073741824.0)
-                                                         : (free_b > reserve ? (uint64_t) free_b - reserve : 0);
-            uint64_t used = 0;
-            for (size_t i = (size_t) prefilled; i < profile.size(); ++i) {
-                const auto& pr = profile[i];
-                if (host_res[(size_t) (pr.first * g.n_expert + pr.second)] >= 0) continue;   // the first GPU holds it
-                const uint64_t b = (lay.blob_bytes(pr.first) + 255) / 256 * 256;
-                if (used + b > budget) break;
-                used += b;
-                sizes.push_back((int64_t) lay.blob_bytes(pr.first));
-                pre.push_back(pr);
-            }
-            {   // the rest in empty slots (without the adaptive tier only the prompt path's loans use them)
-                uint64_t round = 0;
-                for (int64_t l = 0; l < g.n_layers; ++l) round += (lay.blob_bytes(l) + 255) / 256 * 256;
-                for (uint64_t q = (budget - used) / round; q > 0; --q)
-                    for (int64_t l = 0; l < g.n_layers; ++l) {
-                        sizes.push_back((int64_t) lay.blob_bytes(l));
-                        empty2.push_back((int32_t) l);
-                    }
-            }
-            if (sizes.empty()) err = "no VRAM for experts (" + std::to_string(free_b >> 20) + " MiB free)";
-            ok = !sizes.empty() && gpu2.cache().open_sized(sizes, g.n_layers, g.n_expert, err);
-            // as on the main GPU, the reserve must still be free once the slots are written (WDDM makes memory
-            // resident when it is first touched): short of it, the cache reopens without its last (empty) slots
-            for (int attempt = 0; ok && o.second_gpu_gib <= 0 && attempt < 6; ++attempt) {
-                cudaMemset(gpu2.cache().device_slot(0), 0, (size_t) gpu2.cache().bytes());
-                cudaDeviceSynchronize();
-                cudaMemGetInfo(&free_b, &total_b);
-                if ((uint64_t) free_b + (64ull << 20) >= reserve) break;
-                std::fprintf(stderr, "strata generate: second GPU: only %lld MiB free once its slots are written "
-                                     "(reserve %d MiB); shrinking its cache\n", (long long) (free_b >> 20),
-                             o.second_gpu_reserve_mib);
-                gpu2.cache().close();
-                for (uint64_t cut = 0; !sizes.empty() && cut < reserve - free_b + (64ull << 20);) {
-                    cut += ((uint64_t) sizes.back() + 255) / 256 * 256;
-                    sizes.pop_back();
-                    if (!empty2.empty()) empty2.pop_back();
-                    else pre.pop_back();
-                }
-                if (sizes.empty()) err = "no VRAM for experts once the slots are written";
-                ok = !sizes.empty() && gpu2.cache().open_sized(sizes, g.n_layers, g.n_expert, err);
-            }
-            for (size_t i = 0; ok && i < pre.size(); ++i) {
-                const int32_t slot = gpu2.cache().admit(pre[i].first, pre[i].second);
-                const uint8_t* b = srcp->blob(pre[i].first, pre[i].second);
-                ok = slot != strata::core::kNotResident && b != nullptr &&
-                     gpu2.cache().fill_slot_blocking(slot, b, err, (int64_t) lay.blob_bytes(pre[i].first));
-            }
-            cudaSetDevice(main_dev);
-        }
-        if (ok) {
-            host_res2.assign((size_t) (g.n_layers * g.n_expert), strata::core::kNotResident);
-            for (int64_t l = 0; l < g.n_layers; ++l)
-                for (int64_t e = 0; e < g.n_expert; ++e) host_res2[(size_t) (l * g.n_expert + e)] = gpu2.cache().slot_of(l, e);
-        }
-        if (ok && adaptive) {
-            ok = tier2.init(gpu2.cache(), *srcp, host_res2, g.n_layers, g.n_expert, o.adapt_swaps, err,
-                            o.second_gpu, main_dev);
+        std::vector<uint8_t> owned((size_t) (g.n_layers * g.n_expert), 0);   // the main cache and the tiers wired so far
+        for (size_t i = 0; i < host_res.size(); ++i) owned[i] = host_res[i] >= 0 ? 1 : 0;
+        for (size_t ti = 0; ti < o.tier_gpus.size(); ++ti) {
+            const int dev = o.tier_gpus[ti];
+            cudaDeviceProp prop{};
+            cudaGetDeviceProperties(&prop, dev);
+            auto g2 = std::make_unique<strata::core::SecondGpu>();
+            bool ok = g2->init(dev, main_dev, g.n_embd, g.n_ff, o.max_window(), ss.k, err) &&
+                      g2->init_prefetch((int) std::min<uint64_t>(pf_bytes / min_blob, 64), lay0.max_blob, err);
+            std::vector<int64_t> sizes;
+            std::vector<std::pair<int32_t, int32_t>> pre;
+            std::vector<int32_t> empty2;
+            auto res2p = std::make_unique<std::vector<int32_t>>();
+            std::vector<int32_t>& res2 = *res2p;
+            auto t2 = std::make_unique<strata::core::AdaptiveTier>();
             if (ok) {
-                // lowest slots first: the last ones, which the prompt path borrows, stay empty longest
-                for (size_t i = empty2.size(); i-- > 0;) tier2.add_free(empty2[i], (int32_t) (pre.size() + i));
-                tier2.set_upper(&tier);
-                tier.set_lower(&tier2);
-                tier2.set_paced(gpu2.done_event());   // between windows; a window's last share may still read its slots
-                drive.tier2 = &tier2;
+                cudaSetDevice(dev);
+                size_t free_b = 0, total_b = 0;
+                cudaMemGetInfo(&free_b, &total_b);
+                // the prompt path's buffers borrow cache slots on the FIRST live tier, else they are reserved there
+                const bool offload_own = !o.no_prompt_offload && ti < std::min<size_t>(o.tier_gpus.size(), 3) &&
+                                         o.prefill_chunk > 0 && o.no_prefill_borrow;   // PLAY-4GPU: each runner's card
+                const uint64_t reserve = ((uint64_t) o.second_gpu_reserve_mib << 20) +
+                    (offload_own ? strata::prefill::ExpertRunner::bytes_needed(o.prefill_chunk, g.n_expert, true, true) : 0);
+                const uint64_t budget = o.second_gpu_gib > 0 ? (uint64_t) (o.second_gpu_gib * 1073741824.0)
+                                                             : (free_b > reserve ? (uint64_t) free_b - reserve : 0);
+                uint64_t used = 0;
+                for (size_t i = (size_t) prefilled; i < profile.size(); ++i) {
+                    const auto& pr = profile[i];
+                    if (owned[(size_t) (pr.first * g.n_expert + pr.second)]) continue;   // a GPU tier already holds it
+                    const uint64_t b = (lay.blob_bytes(pr.first) + 255) / 256 * 256;
+                    if (used + b > budget) break;
+                    used += b;
+                    sizes.push_back((int64_t) lay.blob_bytes(pr.first));
+                    pre.push_back(pr);
+                }
+                {   // the rest in empty slots (without the adaptive tier only the prompt path's loans use them)
+                    uint64_t round = 0;
+                    for (int64_t l = 0; l < g.n_layers; ++l) round += (lay.blob_bytes(l) + 255) / 256 * 256;
+                    for (uint64_t q = (budget - used) / round; q > 0; --q)
+                        for (int64_t l = 0; l < g.n_layers; ++l) {
+                            sizes.push_back((int64_t) lay.blob_bytes(l));
+                            empty2.push_back((int32_t) l);
+                        }
+                }
+                if (sizes.empty()) err = "no VRAM for experts (" + std::to_string(free_b >> 20) + " MiB free)";
+                ok = !sizes.empty() && g2->cache().open_sized(sizes, g.n_layers, g.n_expert, err);
+                // as on the main GPU, the reserve must still be free once the slots are written (WDDM makes memory
+                // resident when it is first touched): short of it, the cache reopens without its last (empty) slots
+                for (int attempt = 0; ok && o.second_gpu_gib <= 0 && attempt < 6; ++attempt) {
+                    cudaMemset(g2->cache().device_slot(0), 0, (size_t) g2->cache().bytes());
+                    cudaDeviceSynchronize();
+                    cudaMemGetInfo(&free_b, &total_b);
+                    if ((uint64_t) free_b + (64ull << 20) >= reserve) break;
+                    std::fprintf(stderr, "strata generate: tier GPU %d: only %lld MiB free once its slots are written "
+                                         "(reserve %d MiB); shrinking its cache\n", dev, (long long) (free_b >> 20),
+                                 o.second_gpu_reserve_mib);
+                    g2->cache().close();
+                    for (uint64_t cut = 0; !sizes.empty() && cut < reserve - free_b + (64ull << 20);) {
+                        cut += ((uint64_t) sizes.back() + 255) / 256 * 256;
+                        sizes.pop_back();
+                        if (!empty2.empty()) empty2.pop_back();
+                        else pre.pop_back();
+                    }
+                    if (sizes.empty()) err = "no VRAM for experts once the slots are written";
+                    ok = !sizes.empty() && g2->cache().open_sized(sizes, g.n_layers, g.n_expert, err);
+                }
+                for (size_t i = 0; ok && i < pre.size(); ++i) {
+                    const int32_t slot = g2->cache().admit(pre[i].first, pre[i].second);
+                    const uint8_t* b = srcp->blob(pre[i].first, pre[i].second);
+                    ok = slot != strata::core::kNotResident && b != nullptr &&
+                         g2->cache().fill_slot_blocking(slot, b, err, (int64_t) lay.blob_bytes(pre[i].first));
+                }
+                cudaSetDevice(main_dev);
+            }
+            if (ok) {
+                res2.assign((size_t) (g.n_layers * g.n_expert), strata::core::kNotResident);
+                for (int64_t l = 0; l < g.n_layers; ++l)
+                    for (int64_t e = 0; e < g.n_expert; ++e)
+                        if ((res2[(size_t) (l * g.n_expert + e)] = g2->cache().slot_of(l, e)) >= 0)
+                            owned[(size_t) (l * g.n_expert + e)] = 1;
+            }
+            if (ok && adaptive) {
+                ok = t2->init(g2->cache(), *srcp, res2, g.n_layers, g.n_expert, o.adapt_swaps, err, dev, main_dev);
+                if (ok) {
+                    // lowest slots first: the last ones, which the prompt path borrows, stay empty longest
+                    for (size_t i = empty2.size(); i-- > 0;) t2->add_free(empty2[i], (int32_t) (pre.size() + i));
+                    // the exclusion chain: the first tier ranks after the main cache, each later one after the last
+                    t2->set_upper(tiers2.empty() ? (const strata::core::AdaptiveTier*) &tier
+                                                 : (const strata::core::AdaptiveTier*) tiers2.back().get());
+                    if (tiers2.empty()) tier.set_lower(t2.get());
+                    t2->set_paced(g2->done_event());   // between windows; a window's last share may still read its slots
+                }
+            }
+            if (ok) {
+                gpus2.push_back(std::move(g2));
+                res2s.push_back(std::move(res2p));
+                tiers2.push_back(std::move(t2));
+                live_devs.push_back(dev);
+                std::fprintf(stderr, "strata generate: tier GPU %d (%s): %zu experts from the profile and %zu empty "
+                                     "slots, %.2f GiB\n", dev, prop.name, pre.size(), empty2.size(),
+                                     gpus2.back()->cache().gib());
+            } else {
+                // another process may hold its VRAM (a model, a desktop app): the engine runs without this tier
+                std::fprintf(stderr, "strata generate: tier GPU %d unused: %s\n", dev, err.c_str());
             }
         }
-        if (ok) {
-            drive.d.gpu2 = &gpu2;
-            drive.d.host_res2 = host_res2.data();
-            drive.d.gpu2_min_bytes = (uint64_t) (o.second_gpu_min_mb * 1048576.0);
-            std::fprintf(stderr, "strata generate: second GPU %d (%s): %zu experts from the profile and %zu empty slots, "
-                                 "%.2f GiB\n", o.second_gpu, prop.name, pre.size(), empty2.size(), gpu2.cache().gib());
-        } else {
-            // another process may hold its VRAM (a model, a desktop app): the engine runs on the main GPU alone
-            std::fprintf(stderr, "strata generate: second GPU %d unused: %s\n", o.second_gpu, err.c_str());
-            o.second_gpu = -1;
-            host_res2.clear();
+        drive.d.n_tier = (int) gpus2.size();
+        for (size_t t = 0; t < gpus2.size(); ++t) {
+            drive.d.tier[t] = gpus2[t].get();
+            drive.d.host_res_t[t] = res2s[t]->data();
         }
+        drive.d.gpu2_min_bytes = (uint64_t) (o.second_gpu_min_mb * 1048576.0);
+        for (auto& t2 : tiers2) drive.tier2s.push_back(t2.get());
+        if (!drive.tier2s.empty()) drive.tier2 = drive.tier2s[0];
     }
     // the second tier ranks after the first on the same counts, and decays them
     std::string adapt_err;
-    auto adapt = [&]() -> bool {
-        const bool two = tier2.on();
-        return tier.adapt(drive.d.usage, adapt_err, !two) &&
-               (!two || (tier2.adapt(drive.d.usage, adapt_err) && pump_gap(&drive, adapt_err)));
+    auto adapt = [&]() -> bool {   // PLAY-4GPU: main ranks first, then each tier ranks and pumps its own queue
+        const bool two = !tiers2.empty();
+        if (!tier.adapt(drive.d.usage, adapt_err, !two)) return false;
+        for (auto& tp : tiers2) {
+            if (!tp->adapt(drive.d.usage, adapt_err)) return false;
+            drive.tier2 = tp.get();
+            if (!pump_gap(&drive, adapt_err)) return false;
+        }
+        return true;
     };
     drive.adapt = adapt;
     if (tier.on()) drive.tier1 = &tier;   // its copies in pieces, or at once without a second GPU (Drive::tier1)
-    drive.burst = !tier2.on();
+    drive.burst = tiers2.empty();   // PLAY-4GPU: the main tier pumps at once when no GPU tier follows it
     tier.set_wait(drive.burst);
     drive.n_layers = g.n_layers;
     drive.ring_us.assign((size_t) ((strata::kernels::kVerifyMaxT + 1) * g.n_layers), 0.0);
@@ -2393,31 +2554,50 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: token graph captured (48 layers, one launch per token)\n");
     }
 
-    // ---- the batched prompt path, and the second GPU's share of its experts (not --no-prompt-offload)
-    auto setup_prompt_path = [&](strata::prefill::Prefill& prefill, strata::prefill::ExpertRunner& offload,
-                                 PromptBuffers& pbuf, std::string& e) -> bool {
-        const bool off = o.second_gpu >= 0 && !o.no_prompt_offload;
+    // ---- the batched prompt path, and the tier GPUs' share of its experts (not --no-prompt-offload)
+    // PLAY-4GPU: one runner per live tier (up to 3); an expert goes to the runner whose cache holds it, an expert
+    // no GPU holds is spread across them, and each runner computes its share on its own card.
+    auto setup_prompt_path = [&](strata::prefill::Prefill& prefill,
+                                 std::vector<std::unique_ptr<strata::prefill::ExpertRunner>>& offs,
+                                 std::vector<int32_t>& held_any, PromptBuffers& pbuf, std::string& e) -> bool {
+        const int n_off = !gpus2.empty() && !o.no_prompt_offload ? (int) std::min<size_t>(gpus2.size(), 3) : 0;
+        const bool off = n_off > 0;
         // a cache too small to lend the buffers would make them allocate on top of a card the cache filled to its
         // reserve, which then pages: the chunk halves until they fit in the lendable slots (it only reads slower)
         if (!o.no_prefill_borrow && d_res != nullptr && o.expert_cache > 0) {
             SlotLoan probe;
             probe.cache = &xcache;
             int64_t chunk = o.prefill_chunk;
-            while (chunk > 256 && !probe.plan(strata::prefill::Prefill::bytes_needed(g, ss, chunk, off))) chunk /= 2;
-            if (chunk != o.prefill_chunk && probe.plan(strata::prefill::Prefill::bytes_needed(g, ss, chunk, off))) {
+            while (chunk > 256 && !probe.plan(strata::prefill::Prefill::bytes_needed(g, ss, chunk, n_off))) chunk /= 2;
+            if (chunk != o.prefill_chunk && probe.plan(strata::prefill::Prefill::bytes_needed(g, ss, chunk, n_off))) {
                 std::fprintf(stderr, "strata generate: prompt chunk %lld -> %lld tokens so its buffers fit in the expert "
                                      "cache\n", (long long) o.prefill_chunk, (long long) chunk);
                 o.prefill_chunk = chunk;
             }
         }
-        if (off && !offload.init(o.second_gpu, o.main_gpu, nullptr, srcp, &gpu2.cache(),
-                                 host_res2.empty() ? nullptr : host_res2.data(), g.n_expert, o.prefill_chunk, true, e))
-            return false;
+        std::vector<strata::prefill::ExpertRunner*> off_ptrs;
+        std::vector<const int32_t*> offs_res;
+        for (int j = 0; j < n_off; ++j) {
+            offs.emplace_back(std::make_unique<strata::prefill::ExpertRunner>());
+            if (!offs.back()->init(live_devs[(size_t) j], o.main_gpu, nullptr, srcp, &gpus2[(size_t) j]->cache(),
+                                   res2s[(size_t) j]->empty() ? nullptr : res2s[(size_t) j]->data(), g.n_expert,
+                                   o.prefill_chunk, true, e))
+                return false;
+            off_ptrs.push_back(offs.back().get());
+            offs_res.push_back(res2s[(size_t) j]->empty() ? nullptr : res2s[(size_t) j]->data());
+        }
+        held_any.assign((size_t) (g.n_layers * g.n_expert), -1);   // held by ANY GPU: the runners' skip table
+        for (size_t i = 0; i < held_any.size(); ++i) {
+            bool h = !host_res.empty() && host_res[i] >= 0;
+            for (size_t j = 0; j < offs_res.size() && !h; ++j) h = offs_res[j] != nullptr && offs_res[j][i] >= 0;
+            if (h) held_any[i] = 0;
+        }
         if (!prefill.init(wt, g, ss, srcp, o.expert_cache > 0 ? &xcache : nullptr,
-                          host_res.empty() ? nullptr : host_res.data(), o.prefill_chunk, main_cs, off ? &offload : nullptr, e))
+                          host_res.empty() ? nullptr : host_res.data(), o.prefill_chunk, main_cs, off_ptrs, offs_res, e))
             return false;
         pbuf.prefill = &prefill;
-        pbuf.offload = off ? &offload : nullptr;
+        pbuf.off = off_ptrs;
+        pbuf.skip_any = held_any.empty() ? nullptr : held_any.data();
         pbuf.g = &g;
         pbuf.ss = &ss;
         if (d_res != nullptr) {
@@ -2426,11 +2606,13 @@ int main(int argc, char** argv) {
             pbuf.loan.d_res = d_res;
             pbuf.loan.device = pbuf.loan.main_device = o.main_gpu;
         }
-        if (off) {
-            pbuf.loan2.cache = &gpu2.cache();
-            pbuf.loan2.res = &host_res2;
-            pbuf.loan2.device = o.second_gpu;
-            pbuf.loan2.main_device = o.main_gpu;
+        for (int j = 0; j < n_off; ++j) {
+            pbuf.loan2.emplace_back();
+            auto& l2 = pbuf.loan2.back();
+            l2.cache = &gpus2[(size_t) j]->cache();
+            l2.res = res2s[(size_t) j].get();
+            l2.device = live_devs[(size_t) j];
+            l2.main_device = o.main_gpu;
         }
         return pbuf.init(o.prefill_chunk, !o.no_prefill_borrow, e);
     };
@@ -2471,17 +2653,21 @@ int main(int argc, char** argv) {
             return 2;
         }
         strata::prefill::Prefill prefill;
-        strata::prefill::ExpertRunner offload;
+        std::vector<std::unique_ptr<strata::prefill::ExpertRunner>> offs;
+        std::vector<int32_t> held_any;
         PromptBuffers pbuf;
-        if (!setup_prompt_path(prefill, offload, pbuf, err)) {
+        if (!setup_prompt_path(prefill, offs, held_any, pbuf, err)) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
             return 1;
         }
-        if (pbuf.lend || pbuf.lend2)
-            std::fprintf(stderr, "strata serve: the prompt path borrows up to %lld cache slots (%.2f GiB), %lld (%.2f GiB) "
-                                 "on the second GPU\n", (long long) pbuf.loan.slots(), (double) pbuf.loan.bytes() / 1073741824.0,
-                         (long long) pbuf.loan2.slots(), (double) pbuf.loan2.bytes() / 1073741824.0);
-        else
+        if (pbuf.lend || !pbuf.lend2.empty()) {
+            std::fprintf(stderr, "strata serve: the prompt path borrows up to %lld cache slots (%.2f GiB)",
+                         (long long) pbuf.loan.slots(), (double) pbuf.loan.bytes() / 1073741824.0);
+            for (size_t j = 0; j < pbuf.loan2.size(); ++j)   // PLAY-4GPU: each runner's loan, per tier
+                std::fprintf(stderr, ", %lld (%.2f GiB) on tier GPU %d", (long long) pbuf.loan2[j].slots(),
+                             (double) pbuf.loan2[j].bytes() / 1073741824.0, live_devs[j]);
+            std::fprintf(stderr, "\n");
+        } else
             std::fprintf(stderr, "strata serve: the prompt path allocates its own buffers (too few cache slots to borrow)\n");
         mem_mark("the head and the prompt path");
         strata::core::Verifier ver;
@@ -2491,7 +2677,11 @@ int main(int argc, char** argv) {
         vh.slot_off = xcache.slot_offsets();
         vh.slots = xcache.slots();
         vh.blob = thits.blob;
-        ver.set_split_head(split_head.get());
+        {   // PLAY-4GPU: hand every head part to the verifier
+            strata::core::SplitHead* shp[3] = {};
+            for (size_t i = 0; i < split_heads.size(); ++i) shp[i] = split_heads[i].get();
+            ver.set_split_heads(shp, (int) split_heads.size());
+        }
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.max_window(), err) ||
             !mtp.bind(wt, &native_head, ver.final_R_all(), err)) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
@@ -2502,10 +2692,10 @@ int main(int argc, char** argv) {
         ver.set_profile(o.window_profile);
         ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : o.pcie_mode == "kernel" ? 2
                           : native_pack ? 0 : 2);   // auto: DMA for the native packs, the copy kernel for Q2_0
-        if (drive.d.gpu2 != nullptr && gpu2.prefetch_slots() > 0)
+        if (drive.d.n_tier > 0 && drive.d.tier[0] != nullptr && drive.d.tier[0]->prefetch_slots() > 0)
             ver.set_predict(&drive_predict, &drive, o.adapt_every > 0 && o.adapt_swaps > 0);
-        if (drive.d.gpu2 != nullptr) {
-            ver.set_gpu2(true);
+        if (drive.d.n_tier > 0) {
+            ver.set_tiers(drive.d.n_tier);
             ver.set_watch(&drive_watch, &drive);
         }
         if (drive.tier1 != nullptr || drive.tier2 != nullptr) {   // the tiers' updates start at the tail
@@ -2820,7 +3010,7 @@ int main(int argc, char** argv) {
             }
             if (batched_end > reuse) {
                 tier.apply_pending(true);   // no copy may still land in a lent slot
-                tier2.apply_pending(true);
+                for (auto* t2 : drive.tier2s) t2->apply_pending(true);
                 if (!pbuf.take(std::min(o.prefill_chunk, batched_end - reuse), err)) { report(err); return 1; }
                 tr("prompt start", reuse, batched_end);
                 pp_from = reuse;
@@ -3028,22 +3218,27 @@ int main(int argc, char** argv) {
     int64_t pos_start = 0;
     int64_t spec_pos = 0;   // plan v0.3 P6: where the speculative loop starts (0 = not used)
     strata::prefill::Prefill prefill;
-    strata::prefill::ExpertRunner offload;
+    std::vector<std::unique_ptr<strata::prefill::ExpertRunner>> offs;
+    std::vector<int32_t> held_any;
     PromptBuffers pbuf;
     double prefill_batched_ms = 0;
     std::FILE* final_r = o.dump_final_r.empty() ? nullptr : std::fopen(o.dump_final_r.c_str(), "wb");
     std::vector<float> final_r_host(final_r ? (size_t) (g.hc * g.n_embd) : 0);
     if (o.prefill_chunk > 0 && n_prompt > 1) {
         const int64_t n_batched = (o.prefill_until > 0 && o.prefill_until < n_prompt - 1) ? o.prefill_until : n_prompt - 1;
-        if (!setup_prompt_path(prefill, offload, pbuf, err) || !pbuf.take(std::min(o.prefill_chunk, n_batched), err)) {
+        if (!setup_prompt_path(prefill, offs, held_any, pbuf, err) ||
+            !pbuf.take(std::min(o.prefill_chunk, n_batched), err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
-        if (pbuf.lend || pbuf.lend2)
-            std::fprintf(stderr, "strata generate: prompt path borrows %lld cache slots (%.2f GiB), %lld (%.2f GiB) on the "
-                                 "second GPU\n", (long long) pbuf.loan.slots(), (double) pbuf.loan.bytes() / 1073741824.0,
-                         (long long) pbuf.loan2.slots(), (double) pbuf.loan2.bytes() / 1073741824.0);
-        else
+        if (pbuf.lend || !pbuf.lend2.empty()) {
+            std::fprintf(stderr, "strata generate: prompt path borrows %lld cache slots (%.2f GiB)",
+                         (long long) pbuf.loan.slots(), (double) pbuf.loan.bytes() / 1073741824.0);
+            for (size_t j = 0; j < pbuf.loan2.size(); ++j)
+                std::fprintf(stderr, ", %lld (%.2f GiB) on tier GPU %d", (long long) pbuf.loan2[j].slots(),
+                             (double) pbuf.loan2[j].bytes() / 1073741824.0, live_devs[j]);
+            std::fprintf(stderr, "\n");
+        } else
             std::fprintf(stderr, "strata generate: prompt path allocates its own buffers (no cache slots to borrow)\n");
         if (!o.mtp.empty()) {
             if (!mtp.bind(wt, &native_head, nullptr, err)) {
@@ -3059,7 +3254,9 @@ int main(int argc, char** argv) {
             return 1;
         }
         // refill the lent slots from the arena and give them back to the decode tiers
-        const size_t n_lent[2] = {pbuf.loan.lent.size(), pbuf.loan2.lent.size()};
+        size_t n_lent2 = 0;
+        for (const auto& l2 : pbuf.loan2) n_lent2 += l2.lent.size();   // PLAY-4GPU: every tier's loan
+        const size_t n_lent[2] = {pbuf.loan.lent.size(), n_lent2};
         const Clock::time_point tr = Clock::now();
         if (!pbuf.give_back(*srcp, err)) {
             std::fprintf(stderr, "strata generate: refilling a lent slot failed: %s\n", err.c_str());
@@ -3081,11 +3278,11 @@ int main(int argc, char** argv) {
                      (long long) ps.tokens, (long long) ps.chunks, ps.ms_total,
                      ps.ms_total > 0 ? 1000.0 * (double) ps.tokens / ps.ms_total : 0.0, (long long) ps.experts_streamed,
                      (long long) ps.experts_prefetched, ps.ms_experts_host, (long long) ps.experts_resident, ps.ms_ple);
-        if (pbuf.offload != nullptr)
-            std::fprintf(stderr, "strata generate: prefill on the second GPU: experts streamed %lld (%lld ahead), "
-                                 "resident %lld; %.1f ms queuing, %.1f ms GPU\n", (long long) offload.experts_streamed,
-                         (long long) offload.experts_prefetched, (long long) offload.experts_resident, offload.ms_host,
-                         offload.ms_gpu);
+        for (size_t j = 0; j < offs.size(); ++j)   // PLAY-4GPU: each runner's prompt-path tally
+            std::fprintf(stderr, "strata generate: prefill on tier GPU %d: experts streamed %lld (%lld ahead), "
+                                 "resident %lld; %.1f ms queuing, %.1f ms GPU\n", live_devs[j],
+                         (long long) offs[j]->experts_streamed, (long long) offs[j]->experts_prefetched,
+                         (long long) offs[j]->experts_resident, offs[j]->ms_host, offs[j]->ms_gpu);
         if (o.prefill_profile) {
             std::fprintf(stderr, "strata generate: prefill GPU ms by section:");
             for (int i = 0; i < strata::prefill::kPsCount; ++i)
@@ -3347,7 +3544,11 @@ int main(int argc, char** argv) {
         vh.slot_off = xcache.slot_offsets();
         vh.slots = xcache.slots();
         vh.blob = thits.blob;
-        ver.set_split_head(split_head.get());
+        {   // PLAY-4GPU: hand every head part to the verifier
+            strata::core::SplitHead* shp[3] = {};
+            for (size_t i = 0; i < split_heads.size(); ++i) shp[i] = split_heads[i].get();
+            ver.set_split_heads(shp, (int) split_heads.size());
+        }
         ver.set_logits_wanted(!o.window_logits.empty());
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.max_window(), err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
@@ -3364,10 +3565,10 @@ int main(int argc, char** argv) {
         ver.set_host_rows(!o.window_hashes.empty());
         ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : o.pcie_mode == "kernel" ? 2
                           : native_pack ? 0 : 2);   // auto: DMA for the native packs, the copy kernel for Q2_0
-        if (drive.d.gpu2 != nullptr && gpu2.prefetch_slots() > 0)
+        if (drive.d.n_tier > 0 && drive.d.tier[0] != nullptr && drive.d.tier[0]->prefetch_slots() > 0)
             ver.set_predict(&drive_predict, &drive, o.adapt_every > 0 && o.adapt_swaps > 0);
-        if (drive.d.gpu2 != nullptr) {
-            ver.set_gpu2(true);
+        if (drive.d.n_tier > 0) {
+            ver.set_tiers(drive.d.n_tier);
             ver.set_watch(&drive_watch, &drive);
         }
         if (drive.tier1 != nullptr || drive.tier2 != nullptr) {   // the tiers' updates start at the tail
@@ -3439,7 +3640,7 @@ int main(int argc, char** argv) {
         const double pool_ms0 = drive.cpu_ms;
         const int64_t misses0 = drive.d.multi_misses, entries0 = drive.d.multi_entries;
         const uint32_t sleeps0 = pool.sleeps();
-        if (o.stats) drive.d.routed.assign((size_t) (g.n_layers * g.n_expert), 0);
+        if (o.stats || !o.dump_routing.empty()) drive.d.routed.assign((size_t) (g.n_layers * g.n_expert), 0);
         if (use_mtp)
             mtp.on_draft = [&](int j, int32_t tok, float prob) {   // the drafts the next window will verify
                 if (lk == 0 && prob >= (float) o.spec_min_p) ver.ple_ahead(j + 1, tok);
@@ -3614,20 +3815,22 @@ int main(int argc, char** argv) {
                         "%lld moves dropped; %.1f MB/round copied\n", "adaptive tier", (long long) tier.swaps,
                         (long long) tier.fills, o.adapt_every, tier.ms / rounds, (long long) tier.dropped,
                         (double) tier.sent_bytes / 1e6 / (double) rounds);
-        if (rounds > 0 && drive.d.gpu2 != nullptr)
-            std::printf("%-24s %.2f routed entries and %.2f experts per round in %.2f layers (%.2f left to the CPU), "
-                        "its rows after the CPU's in %.2f layers, %.3f ms/round; %lld experts swapped in and %lld into "
-                        "empty slots (%lld still empty, %lld moves dropped; its copies between windows, %.2f ms, at "
-                        "%.1f GB/s); %.2f experts per round prefetched, %.2f of them used (%.3f ms/round of host "
-                        "time, %lld predictions waited for)\n", "second GPU",
-                        (double) gpu2.entries_done / (double) rounds, (double) gpu2.experts / (double) rounds,
-                        (double) gpu2.layers / (double) rounds, (double) drive.d.gpu2_skipped / (double) rounds,
-                        (double) ver.late2 / (double) rounds, ver.ms_late2 / (double) rounds,
-                        (long long) tier2.swaps, (long long) tier2.fills,
-                        (long long) tier2.free_slots(), (long long) tier2.dropped, drive.gap_ms,
-                        tier2.copy_rate() / 1e6, (double) gpu2.prefetch_copied / (double) rounds,
-                        (double) gpu2.prefetch_used / (double) rounds, ver.ms_predict / (double) rounds,
-                        (long long) ver.predict_late);
+        for (int t = 0; rounds > 0 && t < drive.d.n_tier; ++t) {   // PLAY-4GPU: one line per live tier
+            strata::core::SecondGpu* g2 = drive.d.tier[t];
+            strata::core::AdaptiveTier* t2p = t < (int) drive.tier2s.size() ? drive.tier2s[t] : nullptr;
+            const std::string nm = "tier GPU " + std::to_string(live_devs[t]);
+            std::printf("%-24s %.2f routed entries and %.2f experts per round in %.2f layers, %.2f left to the CPU; "
+                        "%.2f layers skipped for latency; %lld swapped in and %lld into empty slots (%lld still empty, "
+                        "%lld moves dropped, %.1f GB/s); %.2f experts/round prefetched, %.2f used\n", nm.c_str(),
+                        (double) g2->entries_done / (double) rounds, (double) g2->experts / (double) rounds,
+                        (double) g2->layers / (double) rounds, (double) drive.d.tier_entries[t] / (double) rounds,
+                        (double) (t < (int) drive.d.kMaxTiers ? drive.d.tier_skipped[t] : 0) / (double) rounds,
+                        t2p ? (long long) t2p->swaps : 0ll, t2p ? (long long) t2p->fills : 0ll,
+                        t2p ? (long long) t2p->free_slots() : 0ll, t2p ? (long long) t2p->dropped : 0ll,
+                        t2p ? t2p->copy_rate() / 1e9 : 0.0,
+                        (double) g2->prefetch_copied / (double) rounds,
+                        (double) g2->prefetch_used / (double) rounds);
+        }
         if (rounds > 0 && !drive.d.routed.empty()) {
             // the share of the routed entries the N most-routed experts of this run take
             std::vector<uint32_t> c = drive.d.routed;
@@ -3673,8 +3876,38 @@ int main(int argc, char** argv) {
     if (routing != nullptr) {
         std::fclose(routing);
         drive.routing = nullptr;
-        std::printf("%-24s %s (%lld records of layer, k, ids, weights)\n", "routing dumped",
-                    o.dump_routing.c_str(), (long long) drive.calls);
+    }
+    if (!o.dump_routing.empty() && !drive.d.routed.empty()) {   // PLAY-4GPU: the window counters, not the per-pool
+        // fwrite trace (whose stdio fd dies early beside the CUDA init: the file stayed 0 bytes through fclose).
+        const int rfd = ::open(o.dump_routing.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (rfd >= 0) {
+            long pairs = 0, entries = 0;
+            char buf[16384];   // read_trace counts one hit per id: the record carries n copies of the id
+            for (int64_t l = 0; l < g.n_layers; ++l)
+                for (int64_t e = 0; e < g.n_expert; ++e) {
+                    const uint32_t n = drive.d.routed[(size_t) (l * g.n_expert + e)];
+                    if (n == 0) continue;
+                    ++pairs;
+                    entries += n;
+                    const int32_t head[2] = {(int32_t) l, (int32_t) n};
+                    (void) ::write(rfd, head, 8);
+                    for (uint32_t q = 0; q < n; ) {
+                        const uint32_t c = (uint32_t) std::min<uint64_t>(n - q, 2048);
+                        for (uint32_t j = 0; j < c; ++j) ((int32_t*) buf)[j] = (int32_t) e;
+                        (void) ::write(rfd, buf, c * 4);
+                        q += c;
+                    }
+                    for (uint32_t q = 0; q < n; ) {
+                        const uint32_t c = (uint32_t) std::min<uint64_t>(n - q, 2048);
+                        for (uint32_t j = 0; j < c; ++j) ((float*) buf)[j] = 1.0f;
+                        (void) ::write(rfd, buf, c * 4);
+                        q += c;
+                    }
+                }
+            ::close(rfd);
+            std::printf("%-24s %s (%ld (layer, expert) pairs from the window counters)\n", "routing dumped",
+                        o.dump_routing.c_str(), pairs);
+        }
     }
     if (o.stage_timing) strata::core::stage_timing_report(g.n_layers);
 

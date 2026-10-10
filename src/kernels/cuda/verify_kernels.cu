@@ -578,6 +578,22 @@ void join_rows(float* dst, int64_t n, const float* a, int64_t na, const float* b
     check("join_rows");
 }
 
+// PLAY-4GPU: dst row t takes [lo, hi) from src row t (width nsrc, mapped); the rest of dst is untouched, so the
+// main GPU's part and each tier's part join independently after the head.
+__global__ void join_range_kernel(float* dst, int64_t n, const float* src, int64_t lo, int64_t hi, int64_t nsrc) {
+    const int64_t t = blockIdx.y;
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < hi - lo;
+         i += (int64_t) gridDim.x * blockDim.x)
+        dst[t * n + lo + i] = ((const volatile float*) src)[t * nsrc + i];
+}
+
+void join_range(float* dst, int64_t n, const float* src, int64_t lo, int64_t hi, int64_t nsrc, int rows,
+                void* stream) {
+    if (hi <= lo) return;
+    join_range_kernel<<<dim3(128, (unsigned) rows), 256, 0, (cudaStream_t) stream>>>(dst, n, src, lo, hi, nsrc);
+    check("join_range");
+}
+
 void row_top_prob_split(const float* logits, int n_rows, int n_vocab, const int32_t* ids, float* probs, void* scratch,
                         void* stream) {
     if (n_rows <= 0) return;

@@ -53,15 +53,17 @@ public:
     Prefill& operator=(const Prefill&) = delete;
 
     /// For chunks of up to `max_chunk` tokens.  `host_res`: the static residency table (n_layers x n_expert, slot
-    /// or -1) or null; `cache` its slots.  `offload`: a runner on a second GPU (initialized, bound by the caller)
+    /// or -1) or null; `cache` its slots.  `offload` (PLAY-4GPU: up to three, one per tier GPU, with the matching
+    /// residency tables): runners on other GPUs (initialized, bound by the caller)
     /// that computes the experts this GPU's cache does not hold; null: they stream here.
     bool init(const core::WeightTable& wt, const core::ModelGeometry& g, core::SessionState& ss,
               core::ExpertSource* src, const core::ExpertCache* cache, const int32_t* host_res, int64_t max_chunk,
-              void* stream, ExpertRunner* offload, std::string& err);
+              void* stream, const std::vector<ExpertRunner*>& offload,
+              const std::vector<const int32_t*>& off_res, std::string& err);
 
     /// Device bytes of the buffers for chunks of `chunk` tokens.
     static uint64_t bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
-                                 bool offload);
+                                 int n_off);
     /// The same with the area its experts are prefetched into (without a second GPU), for the residency as it is now.
     uint64_t bytes_for(int64_t chunk) const;
     /// The buffers for chunks of up to `chunk` tokens, carved from `region` (`bytes` long: lent expert-cache

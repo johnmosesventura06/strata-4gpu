@@ -1,261 +1,78 @@
-<h1 align="center">Strata</h1>
+# Strata on 4 GPUs (1 main + 3 computing tiers)
 
-<p align="center"><b>Run a 125-billion-parameter AI model on a normal gaming PC</b><br>
-one NVIDIA card (12-24 GB) + 64 GB of RAM · Windows or Linux · one click to install</p>
+A fork of [eddoursul/Strata](https://github.com/eddoursul/Strata) (branch `custom`), which is itself a fork of [Niko1221/Strata](https://github.com/Niko1221/Strata). The original project README now lives in [docs/README-upstream.md](docs/README-upstream.md); eddoursul's 3090+5070 Ti comparison is in [docs/COMPARISON.md](docs/COMPARISON.md). Everything here builds on eddoursul's expert-tier design; what we added is the part that scales it past two cards.
 
-<p align="center"><a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4"><img src="docs/media/pagoda-preview.webp" width="720" alt="A voxel pagoda garden that Strata's model wrote, running in the browser"></a><br>
-<sub>A voxel pagoda garden, 1 shot prompt running on an RTX 5070 with Strata (IQ3_S, 128K context) ·
-<a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4">full video (49 s)</a></sub></p>
+The short version: upstream Strata runs Qwen3.8-Flash-Next on one GPU and streams experts in from RAM. eddoursul's fork adds a second GPU that *computes* experts instead of just storing them, roughly doubling decode on a 3090 + 5070 Ti box. Both designs stop at exactly one extra GPU. Our rig is four RTX 5060 Ti 16 GB, so we converted the second-GPU machinery into an N-tier one and measured what each card buys. It's a lot, and none of it required touching the model.
 
-Strata runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)** - a large, smart AI model that
-normally needs a server - on your own PC. It writes its answers at **60-95 tokens per second** (a token is about ¾
-of a word): faster than you can read.
+## What we changed
 
-- **Free and open source.**
+Five things, in the order they landed.
 
-> **This fork** (branch `custom`) is tuned for a PC with an RTX 3090 and an RTX 5070 Ti: the second card works as another
-> expert tier, unsloth's K-quant files run too, and prompts and answers are faster. How it compares with llama.cpp and
-> upstream Strata on that PC: [docs/COMPARISON.md](docs/COMPARISON.md). Its configs, and how to run them:
-> [examples/](examples/README.md).
+1. **The tier array** (`src/core/expert_source.cpp`, `src/core/verify.cpp`). The per-layer plan, the grouped-expert graph, the prefetch stream and the completion flag were all built around one `SecondGpu`. Entries now bucket per owning tier, each tier submits its own captured graph, and the fan-in waits one 64-byte flag line per (token-group, tier) instead of one per group. The entry list the combine kernel reads stays merged, so the window graph keeps its shape.
+2. **`--tier-gpus 1,2,3`** (`src/program/generate.cpp`). One init loop instead of a hard-coded pair. Each tier gets its own `ExpertCache`, its own `AdaptiveTier` (chained: every tier ranks after the caches above it and never duplicates them), its own prefetch deal, and its own health watch. The old `--second-gpu N` still works and means `--tier-gpus N`.
+3. **N-way head split** (`src/core/split_head.*`). The original `--head-split` parked a share of the output-head rows on the second GPU only. `SplitHead::init` now takes an explicit `[start, end)` range and the window joins up to three parts plus the main card's, with the argmax merge picking across all of them.
+4. **N-way prompt offload** (`src/prefill/prefill.cpp`). The batched prompt path used to hand all non-resident experts to one runner. Now a prompt expert goes to the runner whose cache holds it, experts no GPU holds are spread by hash, each runner stages from its own card's lent cache slots, and `gr_write` folds up to three fp16 partial sums into the residual in one pass. Prefill is where this shows.
+5. **A routing-trace fix.** `--dump-routing` in the fork writes through a stdio FILE whose fd dies next to CUDA init: hundreds of pool calls, a cheerful `routing dumped (N records)` line (N is `drive.calls`, not records), and a 0-byte file. `make_profile.py` then "works" by quietly using only the base ranking. We replaced it with a counter-based dump from `ExpertDispatch::routed`, written with raw fd calls. Upstream main flushes its trace and doesn't have this shape, so this one is fork-specific.
 
-> **Jump to:** [How fast?](#how-fast-is-it) · [Which model?](#which-model-should-i-pick) · [Install](#install) ·
-> [Using it](#using-it) · [Problems?](#something-went-wrong) · [How it works](#how-does-it-work) ·
-> [All the details](docs/DETAILS.md)
+## The speed ladder
 
----
+RTX 5060 Ti ×4 (PCIe gen5, x8/x4/x8/x4 CPU-direct), 9950X, 128 GB DDR5-5000, 131K int8 KV unless noted, `UD-Q4_K_XL`, MTP + prompt-lookup on, single stream, greedy, engine-measured tokens/s.
 
-## How fast is it?
+| Step | Decode (sustained) | Notes |
+|---|---|---|
+| main + 1 tier | 49–53 t/s | matches the fork's own issue-#392 dual-5060-Ti report (50–60 on a much weaker box) |
+| main + 2 tiers | 72–78 t/s | tiers fill from the profile ranking, disjoint windows |
+| main + 3 tiers | 80–89 t/s | ~65% of all 24,576 experts live in VRAM; the CPU pool nearly starves |
+| + bound draft head | 91–94 t/s | `rt/draft_vocab.bin` was missing on our build; see pitfalls. Bigger win than the head split |
+| + head-split 0.40–0.75 | 94–99 t/s | one card holding the share measured best; 3-way spread landed equal, kept as the right shape |
+| + N-way prompt offload | 92–94 sustained | 99–110 on short turns, best burst 110.8 |
 
-Measured on an RTX 5070 (12 GB), a Ryzen 5 7600 and 64 GB of RAM:
+Prefill, cold: 16K prompts went 1,878 → 2,159 t/s with the N-way prompt path. A 220K-token prompt reads at 2,420 t/s (was 2,129–2,175) and a needle buried at 211K still comes back verbatim. Warm-prefix reuse is another tier of its own: the fork's stashed conversation cache replayed a 94K and a 211K prompt in about 12 s each.
 
-| Size | Writes answers (short chat) | Writes answers (128K context) | Reads your prompt |
-| --- | ---: | ---: | ---: |
-| **Q2_0** | 93 tokens/s | 74 tokens/s | 2,170 tokens/s |
-| **IQ2_XS** | 79 tokens/s | 63 tokens/s | 2,090 tokens/s |
-| **IQ3_XXS** | 62 tokens/s | 49 tokens/s | 1,750 tokens/s |
-| **IQ3_S** | 53 tokens/s | 46 tokens/s | 1,620 tokens/s |
-| **Coder** (IQ1_M) | 55 tokens/s | 43 tokens/s | 2,180 tokens/s |
+One honest footnote. Between-boot numbers wobble about ±3%, and generated-text tokens/s wobble more, because prompt-lookup accept rate depends on what the model wrote. Same-boot A/B pairs are the real signal; a lone 90s or 100s reading is ballpark. The 3-way head in particular measured +2.3 over its own control, inside noise; it stays because it's the architecture, not because this box felt it.
 
-- **Writes answers** = how fast the reply appears (tokens per second).
-- **Reads your prompt** = how fast it takes in what you send (long documents, code, chat history), measured on a
-  32K-token prompt; a 4K prompt reads at 910-1,580 tokens/s. A 32K prompt takes about 15 seconds with Q2_0.
+## Running it
 
-A card with more VRAM is faster, because more of the model fits on the GPU: an RTX 3090 (24 GB) should do roughly
-100-140 tokens per second. All measurements, long-context numbers and estimates for other cards are in the
-[details](docs/DETAILS.md#speed-measured).
+Build deps: cmake, ninja, a CUDA 13 toolkit (we used 13.3), and an NVIDIA driver new enough for it. From the repo root:
 
-Every PC is different: `START-HERE.bat --calibrate` measures a few engine settings on yours and keeps the fastest
-(about 5-10 minutes; on the PC above it made the Coder 7% faster).
+```
+cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release \
+  -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=OFF \
+  -DCMAKE_CUDA_ARCHITECTURES=120
+cmake --build build --target strata
+```
 
-**Two or three NVIDIA cards?** Just run `START-HERE.bat`: it lists your cards, says which ones Strata can use, and
-asks whether to share the model across them (recommended when two can). An install made on one card asks once at
-its next start. Or choose yourself: `START-HERE.bat --gpus 0,2` (both, remembered), `--gpus all`, or `--gpu 0` (one
-card, this start only). Each card keeps the experts of its own layers, and prompts flow through the cards in a
-pipeline: on an RTX 5080 + RTX 3090 prompts were read 18-20% faster than on the 5080 alone, decoding on par.
-Every card must be an RTX 20 series or newer with 8 GB or more. See [docs/MULTI_GPU.md](docs/MULTI_GPU.md).
+Weights: `unsloth/Qwen3.8-Flash-Next-GGUF`, the `UD-Q4_K_XL/` four shards, into `Strata-data/models/UD-Q4_K_XL/` (the fork's examples README says flat filenames; they actually live under that subdirectory). Pack:
 
-## Which model should I pick?
+```
+python3 tools/iq_pack.py --out ../Strata-data/packs/ud-q4_k_xl \
+  --gguf ../Strata-data/models/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
+```
 
-**The size** (the same model, compressed more or less):
+MTP draft layer: `tools/mtp_fetch.py fetch` pulls ~5 GB of `mtp.*` tensor ranges from the BF16 checkpoint over HTTP without downloading the checkpoint, then `tools/mtp_pack.py` and `tools/mtp_rt.py` build the runtime folder. Then the step nobody documents: copy `data/draft_vocab.bin` into that runtime folder. Without it `--head-split` silently no-ops and you lose about 10% decode for a reason you'll never guess from the logs.
 
-| Model | RAM+VRAM Requirements | Speed | Quality |
-| --- | ---: | --- | --- |
-| **Q2_0** | 37.6 GB | fastest | good |
-| **IQ2_XS** | 39.2 GB | fast | better (**recommended**) |
-| **IQ3_XXS** | 47.0 GB | slower | great |
-| **IQ3_S** | 54.8 GB | slowest | best: matches the full model on the published tests (original model only) |
+Serve with `examples/ud-q4_k_xl-4gpu.json` (or your own) on whatever port is free:
 
-**Will it fit?** Shard 1 is the part of the model that gets loaded when it starts: its experts go into your **RAM**,
-the rest onto your graphics card (the second shard, a 29 GB lookup table, stays on the SSD). So it fits when your
-**RAM is at least shard 1 + about 10 GB** for Windows and your other programs. With 64 GB of RAM every size fits
-(IQ3_S with little else open); with 48 GB, Q2_0 and IQ2_XS. A bigger graphics card makes it faster, but it doesn't
-lower the RAM needed.
+```
+python3 serve/server.py --engine strata --config examples/ud-q4_k_xl-4gpu.json --port 8090
+```
 
-**The version:**
+## Pitfalls we hit so you don't
 
-- **Qwen3.8-Flash-Next** - the original.
-- **[Coder](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF)** - ISTA-DASLab's coding
-  version: half of the experts removed, keeping the ones that code, tool use and images need (91% of the full model's
-  SWE-bench Verified score, 99% of LiveCodeBench, by its authors). One size (IQ1_M: its experts stored like IQ3_S):
-  shard 1 is **29.6 GB**, so it fits a PC with **32 GB of RAM**, runs 262K context on 64 GB, and reads long prompts
-  the fastest of all. Weaker outside coding.
-- **[Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF)** - a fine-tune by UkisAI
-  that thinks much shorter before answering, so you get the answer sooner, with about the same quality. Same speed per
-  token, and about the same RAM as the same size of the original (no IQ3_S). Its own license applies (see its page).
+- `--vram-reserve-mib` defaults to 700. Big contexts need ~1500 or the prefill cuBLAS side-stream handles can't allocate and the engine dies before READY, printing what looks like a progress line (`prefill gemm: side streams` is an error string).
+- After killing a loaded engine, its ~71 GiB pinned arena takes 10–40 s to release. Relaunching immediately fails with `cudaMalloc(1.48 GB) for the weight arena failed`. Wait for the cards to read idle.
+- `--head-split 1.0` is silently refused (the guard wants `< 1.0`), and the refusal is one buried line at boot.
+- The `set_gpu2`-era naming is everywhere; "second GPU" now means "a tier". We left the names alone, a rename is a PR of its own.
+- 256K context fits on the main card because the expert cache is `auto`: it measures free VRAM after the KV pool lands, so growing context just lets ranked experts fall into the tiers by itself. Config edit, not migration.
 
-Not sure? Take **IQ2_XS** - or the **Coder** if you mainly write code, or have 32-48 GB of RAM. You can add another
-one later with `SETUP.bat` (the same as `START-HERE.bat --setup`; on Linux `./setup.sh --setup`).
+## Relationship to the parent repos
 
-For **OrcaRouter's Flash-Next Uncensored IQ3_XXS**, see the [manual compatibility setup](docs/ORCA.md).
-It needs an explicit packing conversion and is not an installer menu option.
+A PR to eddoursul/Strata `custom` is open from this repo's `custom-4gpu` branch and applies to `custom@3a199441`, which is still that branch's tip.
 
-An **AMD Radeon RX 7900 XT / XTX, RX 9070 / 9070 XT or Radeon AI PRO R9700 on Linux** works too (experimental):
-`./setup.sh --backend hip`, chosen by itself on a PC with no NVIDIA card Strata can use. It installs ROCm without sudo
-and compiles the engine (one GPU, no images yet). Details: [AMD HIP](docs/AMD_HIP.md).
+Upstream Niko1221/Strata deliberately gets no PR from us: it has no expert-tier code at all (its multi-GPU is a layer split) and its routing trace already flushes. Our work is a fork of a fork, and the right upstream is the middle one.
 
-## Install
-
-**You need:** an NVIDIA RTX 20, 30, 40 or 50 card with 12 GB of VRAM or more (RTX 20 since 0.1.27), enough RAM for the size you pick (above;
-a big GPU makes up for less RAM - the [low-RAM mode](docs/DETAILS.md)),
-~80 GB of free disk space (an SSD makes the first start much faster), and Windows 10/11 or Linux. The only thing you
-install yourself is a current **NVIDIA driver** ([nvidia.com/drivers](https://www.nvidia.com/drivers) or the NVIDIA
-App). Everything else - Python, the engine, the model - is set up for you.
-
-**Windows**
-
-1. [Download this project](https://github.com/Niko1221/Strata/archive/refs/heads/main.zip) and unzip it (or `git clone` it).
-2. Double-click **`START-HERE.bat`**.
-3. Answer a few questions - or just press Enter each time for the recommended choice:
-   - **Which model and size?** The original or Swift 1.5, and Q2_0, IQ2_XS, IQ3_XXS or IQ3_S - see [above](#which-model-should-i-pick)
-   - **How much context?** How much text it can keep in mind at once (it suggests one for your card). 384K and
-     512K (experimental) extend the model past its trained 262K by rope scaling - the setup turns it on itself (yarn and a
-     covering factor; `--rope-scaling`/`--rope-scale` override) ([details](docs/DETAILS.md))
-   - **Images?** Whether it should also read pictures
-   - **Experimental speed projection?** Off unless you say yes - [read what it does](docs/DETAILS.md#experimental-speed-projection-experimental-off-by-default) first
-
-Then it downloads everything (the model is ~70 GB, so the first time takes a while - you can stop and it picks up
-where it left off) and **starts the model**. Your browser opens the Strata app at `http://127.0.0.1:8080`.
-
-> **While the model starts, your PC can be slow or stop responding for 1-3 minutes** (longest the first time): Strata
-> loads 35-55 GB into your RAM and locks part of it for the graphics card. That's normal - wait, and don't close the
-> window. The window tells you what it is doing.
-
-**Next time**, just double-click `START-HERE.bat` again: it starts right away, nothing is downloaded twice. Close its
-window to stop the model.
-
-**Updating:** download the new version and unzip it anywhere (or `git pull`), then run `START-HERE.bat` in it. The
-model files are kept in a `Strata-data` folder next to your Strata folder, so a new copy finds them and sets itself up
-the same way - nothing big is downloaded again.
-
-**Linux:** run `./setup.sh` - same questions, same result.
-
-**Docker (Linux):** the same idea, in a container.
-
-1. Host: Docker with the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
-   and a driver **580 or newer** (CUDA 13.0).
-2. Build (this compiles the engine into the image, so the container never compiles):
-   `docker build -t strata .`
-   `docker build -t strata --build-arg CUDA_ARCHITECTURES=89 .` builds for one card only (faster).
-   The default covers RTX 30 (86), RTX 40 (89), RTX 50 (120) and A-series (80); a card outside that
-   set needs a rebuild with its own arch. Add `--build-arg BUILD_VISION=0` to skip the image encoder.
-3. Run (the first start downloads the ~70 GB model, then starts; later starts go straight to serving):
-   `docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 -v strata-data:/data strata`
-
-   The setup choices are env vars: `-e MODEL=IQ2_XS -e FAMILY=qwen -e CONTEXT=32768 -e VISION=no`
-   (or `MODEL=Q2_0|IQ3_XXS|IQ3_S`, `FAMILY=swift|coder`; the defaults above are the recommended ones).
-   `-e VISION=cpu` keeps the image encoder on the CPU. `-e KV=int8|q4_0|k8v4` picks the KV cache
-   precision; `k8v4` is INT8 K with 4-bit V and keeps its KV in VRAM from 64K up.
-   Only the model files, the prepared pack, the MTP layer and the install config live in the
-   `strata-data` volume; the engine is part of the image. Switching between models already on the
-   volume needs no setup pass: `-e MODEL=Q2_0 -e FAMILY=coder` picks that model's config. Add
-   `-e REINSTALL=1` only to change settings for a model already set up (context, vision, KV, host,
-   api_key, LOW_RAM), since those are recorded in its config.
-   Strata loads 32-62 GB into RAM. `--gpus all` on a host with two usable cards takes both: the
-   layer split is setup's recommended default ([docs/MULTI_GPU.md](docs/MULTI_GPU.md)), and a volume
-   set up for one card switches to the pair on its first start there. Pin one card with `-e GPU=0`,
-   or name them with `-e GPUS=0,2` and where the later card's layers start with `-e LAYER_SPLIT=18`.
-   A memory limit needs `-e LOW_RAM=on`, which maps the model's experts from the pack instead of
-   keeping them in RAM: setup.py measures the host's RAM, not the container's limit, so it cannot
-   see a cap. LOW_RAM runs on one card.
-   The server listens on `0.0.0.0:8080` by default; set `-e API_KEY=<secret>` before exposing the port
-   to a network. The image has a `HEALTHCHECK` on `/health`, so `docker ps` shows the container
-   healthy once the model is loaded, and `GET /v1/status` says what it is running.
-
-## Using it
-
-<p align="center"><img src="docs/media/runpagoda.png" width="900" alt="The Strata app's Monitor tab next to a coding agent"><br>
-<sub>The Strata app's <b>Monitor</b> (left) while a coding agent writes the pagoda garden from the video (right)</sub></p>
-
-- **In the browser:** `http://127.0.0.1:8080` - the Strata app (it opens by itself when the model starts): **Chat**, a
-  live **Monitor** of the model and your GPU/CPU/RAM, and **About** with the settings and addresses.
-- **Chat in the terminal:** `.venv\Scripts\python chat.py`
-- **Your apps and coding agents:** add it as an "OpenAI-compatible" provider with base URL
-  **`http://127.0.0.1:8080/v1`**, any API key and any model name. Apps that use Anthropic's API: `http://127.0.0.1:8080/v1/messages`.
-- **Thinking:** the model thinks before it answers. Choose **off, low, medium or high** - in the chat page menu, with
-  `/think low` in `chat.py`, or with your app's "reasoning effort" setting. Off is fastest; high is best for hard questions.
-- **Pictures:** in the chat page click **Picture**; in `chat.py` type `/image <path>`; in apps just attach them.
-- **From your phone or another PC:** `START-HERE.bat --setup --host 0.0.0.0 --api-key <secret>`, then open the
-  address the server window prints; see the [details](docs/DETAILS.md#using-it).
-- **Experimental speed projection (off by default):** an experimental control vector that setup can turn on; it
-  changes how the model answers - read [what it does](docs/DETAILS.md#experimental-speed-projection-experimental-off-by-default) first.
-
-**Good to know:** it answers one request at a time. The next turn of a chat continues from what it has already read,
-so only the new text is processed; a long document it reads for the first time takes about 1 minute per 30,000 tokens
-before it starts writing.
-
-## Something went wrong?
-
-**My PC froze, or got very slow, the first time Strata started.**
-That's normal while it starts, most of all the first time. Strata loads 35-55 GB into your RAM, locks part of it for
-the graphics card, and works out how much of the model fits on your GPU. The mouse can freeze for a few minutes. **Wait, and don't close the
-window.** The next starts are much faster. Still frozen after 10 minutes? Restart the PC, close other programs
-(browsers use a lot of RAM) and try again. If it keeps happening, pick a smaller size (Q2_0 or IQ2_XS).
-
-**It stopped while downloading or installing.**
-Run `START-HERE.bat` again. It continues where it stopped.
-
-**It says the NVIDIA driver is too old.**
-Update it (NVIDIA App or [nvidia.com/drivers](https://www.nvidia.com/drivers)), restart the PC, and run
-`START-HERE.bat` again.
-
-**It says port 8080 is already in use.**
-Strata is already running. Look for its window.
-
-**It's very slow and the disk light keeps blinking.**
-Your PC is out of free RAM. Close other programs, or pick a smaller size (Q2_0 or IQ2_XS).
-
-**An answer stopped with "the engine stopped unexpectedly".**
-Usually not enough RAM (on Linux the system then stops the engine). Just send your message again: Strata starts the
-engine by itself. If it keeps happening, close other programs or pick a smaller size.
-
-**It says the prompt exceeds the context.**
-The conversation is longer than the context you chose. Start a new chat, or run `SETUP.bat` and pick more
-context.
-
-**Still stuck?** Look in the [full troubleshooting table](docs/DETAILS.md#troubleshooting), or open an issue and
-attach `strata-<model>.log` from the Strata folder.
-
-## How does it work?
-
-Models like this one normally run on servers with hundreds of gigabytes of graphics memory. Your graphics card has
-12-24 GB. Strata makes it fit by **sharing the work across your whole PC** - the same idea as a kitchen, where the
-things you use all the time stay on the counter and the rest waits in the pantry.
-
-<p align="center"><img src="docs/media/how-it-works.svg" width="860" alt="The model's 24,576 experts: the busiest on the graphics card, all of them in RAM, a lookup table on the SSD"></p>
-
-- **The model is a team of 24,576 small specialists ("experts"),** and each word it writes needs only 10 of them.
-  So it doesn't have to have all of them on the graphics card at once.
-- **Your graphics card** does the part of the work needed for every word, and keeps the few thousand experts that
-  are asked most often. It keeps learning which ones those are while you use it.
-- **Your RAM** holds every expert. When a word needs one the card doesn't have, **your processor** works on it -
-  at the same time as the graphics card, so neither waits for the other.
-- **Your SSD** holds a big lookup table; the model only reads a few small rows of it per word.
-
-<p align="center"><img src="docs/media/guess-and-check.svg" width="860" alt="A small helper guesses the next words; the big model checks them all at once and keeps the right ones"></p>
-
-- **Guess, then check.** A small, fast helper built into the model guesses the next few words, and the big model
-  checks all the guesses in one go. It keeps the ones it agrees with and writes the next word itself - so one step
-  often produces several words. The helper only guesses - the big model decides every word - so you get the same
-  quality answer, 1.6-1.8x sooner.
-- **Long texts are read in big pieces** (up to 8,192 tokens - pieces of words - at a time), which is why a long
-  document or code base is read at over 1,000 tokens per second.
-
-Want the full picture? The [details](docs/DETAILS.md#how-it-works) explain every part and its numbers, and the
-[paper](docs/paper/Strata-Paper.pdf) tells the whole story, with the measurements behind it.
-
-## Credits
-
-- Model: [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team; compressed versions by
-  [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF);
-  [Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF) by UkisAI. Their licenses apply
-  to the model files.
-- Built with parts of [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) (MIT). Ideas from
-  [Splash](https://github.com/incoai/splash), [ninfer](https://github.com/Neroued/ninfer) and
-  [HyperQwen](https://github.com/syv-ai/HyperQwen). More in the [details](docs/DETAILS.md#credits-and-licenses).
+A 4×5060 Ti footnote for the vLLM crowd, since that's where this rig's day job runs: our production lane banks 59.7 t/s at 455K context with batch-2 concurrency against these numbers. Different trade, not a loss: this engine is one user, 256K, fast, and it never syncs attention across cards. Want concurrency and half-a-million tokens? That's tensor parallelism and collectives, and that's a different program.
 
 ## License
 
-Strata is open source under the [MIT License](LICENSE). A few parts carry their own licenses: `third_party/ggml`
-(MIT, llama.cpp / ggml), the web app's font (SIL Open Font License 1.1) and the experimental speed projection's
-vector in `data/experimental-speed-projection` (Qwen Community License 1.0, from the model's activations). The
-models are not part of this repository; each model's own license applies to its files.
+MIT, same as both parents. Model weights are not in this repo; each model's own license applies.

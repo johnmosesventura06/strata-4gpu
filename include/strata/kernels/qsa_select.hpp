@@ -39,6 +39,6 @@ constexpr int64_t qsa_score_grid_blocks = 10496;
 
 /// ids [nq, cap] (cells, ascending); `cap` >= the largest selection width.
 void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
-                    const QsaShapes& s, int32_t* ids, void* stream);
+                    const QsaShapes& s, int32_t* ids, void* stream, int64_t active_blocks = 0);  // PLAY-500K: upstream cluster topk; 0 = the capacity rule
 
 }  // namespace strata::kernels

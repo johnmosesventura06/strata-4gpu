@@ -89,13 +89,19 @@ struct GpuPlanSink {
     int pcie_mode = 0;
     /// The GPU reads only the rows it did not compute, so the pool leaves the GPU's rows of `out` unwritten.
     bool host_rows_only = false;
-    /// The second GPU's share of this token group (mapped; null without one): its entries, [n, pad x3, entries], and
+    /// A tier GPU's share of this token group (mapped; null without one): its entries, [n, pad x3, entries], and
     /// the flag its graph raises to `ring` once their rows are in `out`, which the main GPU waits for.  The pool
-    /// raises the flag itself when the second GPU takes no share, and sets `gpu2_ring` to `ring` once the flag is
-    /// raised or a share is submitted.
-    int32_t* gpu2_list = nullptr;
-    uint32_t* gpu2_flag = nullptr;
-    uint32_t ring = 0, gpu2_ring = 0;
+    /// raises the flag itself when the tier takes no share, and sets `tier_ring` to `ring` once the flag is
+    /// raised or a share is submitted.  PLAY-4GPU: one list/flag/ring per tier (up to kMaxTiers).
+    static constexpr int kMaxTiers = 4;
+    int32_t* tier_list[kMaxTiers] = {};
+    uint32_t* tier_flag[kMaxTiers] = {};
+    uint32_t ring = 0;
+    uint32_t tier_ring[kMaxTiers] = {};
+    /// Back-compat aliases for the single-tier path (Inc1 keeps behavior identical through these).
+    int32_t*& gpu2_list = tier_list[0];
+    uint32_t*& gpu2_flag = tier_flag[0];
+    uint32_t& gpu2_ring = tier_ring[0];
     /// This token group's activations as the window's router wrote them (mapped): ggml's Q8_K rows, `xk_stride` bytes
     /// apart, when the layer takes them (`pool_takes_q8k`), else null (the pool quantizes the floats); and the q8_1
     /// rows (n_embd / 32 blocks each) the second GPU takes.
@@ -235,16 +241,25 @@ struct ExpertDispatch {
     /// Routed (token, expert) entries per (layer, expert) in verify windows, when the caller sizes it: how many of
     /// the entries a cache of the N most-routed experts would serve.
     std::vector<uint32_t> routed;
-    /// A second GPU's expert tier (verify windows) and its residency table (n_layers x n_expert, slot or -1): the
-    /// experts it holds or has prefetched and the first GPU's cache does not are computed there, beside the CPU pool.
-    SecondGpu* gpu2 = nullptr;
-    const int32_t* host_res2 = nullptr;
-    int64_t gpu2_entries = 0;      ///< routed entries the second GPU served
-    int64_t gpu2_skipped = 0;      ///< layers the CPU took the second GPU's share of (it was quicker)
-    bool gpu2_used = false;        ///< this layer's decision
-    uint64_t gpu2_min_bytes = 0;   ///< a layer's miss bytes from which the second GPU takes its share
-    uint64_t gpu2_prefetch_bytes = 0;   ///< per layer, its likeliest experts no GPU holds, copied there ahead
-    std::string gpu2_err;          ///< `fail` points here when the second GPU failed
+    /// Tier GPUs' expert tiers (verify windows) and their residency tables (n_layers x n_expert, slot or -1): the
+    /// experts a tier holds or has prefetched and the first GPU's cache does not are computed there, beside the CPU
+    /// pool.  PLAY-4GPU: tier[0..n_tier); the gpu2* aliases keep the single-tier field names compiling while the
+    /// dispatch is generalized (Inc1), and generate.cpp writes the arrays through the same names.
+    static constexpr int kMaxTiers = GpuPlanSink::kMaxTiers;
+    SecondGpu* tier[kMaxTiers] = {};
+    int n_tier = 0;
+    const int32_t* host_res_t[kMaxTiers] = {};
+    int64_t tier_entries[kMaxTiers] = {};   ///< routed entries each tier served
+    int64_t tier_skipped[kMaxTiers] = {};   ///< layers the CPU took this tier's share of (it was quicker)
+    bool tier_used[kMaxTiers] = {};         ///< this layer's decision, per tier
+    uint64_t gpu2_min_bytes = 0;   ///< a layer's miss bytes from which a tier takes its share (shared threshold)
+    uint64_t gpu2_prefetch_bytes = 0;   ///< per layer, its likeliest experts no GPU holds, copied to a tier ahead
+    std::string gpu2_err;          ///< `fail` points here when any tier failed
+    SecondGpu*& gpu2 = tier[0];
+    const int32_t*& host_res2 = host_res_t[0];
+    int64_t& gpu2_entries = tier_entries[0];
+    int64_t& gpu2_skipped = tier_skipped[0];
+    bool& gpu2_used = tier_used[0];
     /// Set when `dispatch` could not produce an answer.  The loop itself has no error channel, so this is
     /// where a source failure surfaces: the driver checks it after `session_loop` returns rather than the
     /// engine computing from a half-filled `parts`.
